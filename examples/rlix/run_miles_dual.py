@@ -38,17 +38,27 @@ from __future__ import annotations
 
 import copy
 import os
-import sys
 
-# F08 / F41 — fail fast if RLix entry is invoked without the env var.
-# The check must happen BEFORE any heavy import (torch / sglang /
-# megatron) so CVD has a chance to take effect via Ray runtime_env.
-if os.environ.get("RLIX_CONTROL_PLANE") != "rlix":
-    sys.stderr.write(
-        "examples/rlix/run_miles_dual.py requires RLIX_CONTROL_PLANE=rlix.\n"
-        "    RLIX_CONTROL_PLANE=rlix python -m examples.rlix.run_miles_dual ...\n"
+# Support both `python -m examples.rlix.run_miles_dual` (package context) and
+# `python examples/rlix/run_miles_dual.py` (direct script, no parent package).
+try:
+    from ._common import (
+        MilesPipelineConfig,
+        build_pipeline_runtime_env,
+        require_rlix_control_plane,
     )
-    sys.exit(2)
+except ImportError:
+    from _common import (
+        MilesPipelineConfig,
+        build_pipeline_runtime_env,
+        require_rlix_control_plane,
+    )
+
+# Fail fast before any heavy import (torch / sglang / megatron) so per-actor
+# CUDA_VISIBLE_DEVICES can take effect via Ray runtime_env.
+require_rlix_control_plane(
+    "examples/rlix/run_miles_dual.py", "examples.rlix.run_miles_dual"
+)
 
 
 def _split_pools_for_dual(
@@ -113,8 +123,9 @@ def _overlap_pools_from_env(num_gpus_per_node: int) -> (
     """Read per-pipeline mappings from ``MILES_DUAL_*`` env vars.
 
     Returns ``((p1_train, p1_infer), (p2_train, p2_infer))`` if **all four**
-    env vars are set; otherwise ``None`` (caller falls back to
-    ``_split_pools_for_dual``). Validates:
+    env vars are set, or ``None`` if **none** are set (caller falls back to
+    ``_split_pools_for_dual``). A partial set raises ``ValueError`` so a typo
+    or missing var cannot silently switch the topology. Validates:
       - each GPU id is in ``[0, num_gpus_per_node)``
       - per-pipeline ``train ⊆ infer`` (partial-overlap inside pipeline)
       - no duplicate IDs within a single mapping
@@ -122,12 +133,23 @@ def _overlap_pools_from_env(num_gpus_per_node: int) -> (
     here; the harness ``grep_overlap_log.sh`` asserts the overlap-non-empty
     condition end-to-end.
     """
-    p1_train = _parse_gpu_list("MILES_DUAL_P1_TRAIN")
-    p1_infer = _parse_gpu_list("MILES_DUAL_P1_INFER")
-    p2_train = _parse_gpu_list("MILES_DUAL_P2_TRAIN")
-    p2_infer = _parse_gpu_list("MILES_DUAL_P2_INFER")
-    if None in (p1_train, p1_infer, p2_train, p2_infer):
+    env_names = (
+        "MILES_DUAL_P1_TRAIN", "MILES_DUAL_P1_INFER",
+        "MILES_DUAL_P2_TRAIN", "MILES_DUAL_P2_INFER",
+    )
+    mappings = [_parse_gpu_list(name) for name in env_names]
+    present = [name for name, m in zip(env_names, mappings) if m is not None]
+    if not present:
         return None
+    if len(present) != len(env_names):
+        # All-or-nothing: a partial set is almost always a typo or a missing
+        # var, which would silently fall back to disjoint topology.
+        missing = [name for name in env_names if name not in present]
+        raise ValueError(
+            f"MILES_DUAL_* overlap mapping requires all four env vars; "
+            f"set={present} missing={missing}"
+        )
+    p1_train, p1_infer, p2_train, p2_infer = mappings
     for label, mapping in (
         ("p1_train", p1_train), ("p1_infer", p1_infer),
         ("p2_train", p2_train), ("p2_infer", p2_infer),
@@ -277,26 +299,13 @@ def _build_pipeline(
         cluster_device_mappings=cluster_device_mappings,
     )
 
-    pipeline_runtime_env_vars = {
-        "PIPELINE_ID": str(pipeline_id),
-        "ROLL_RAY_NAMESPACE": pipeline_namespace,
-        "RLIX_CONTROL_PLANE": "rlix",
-        # Per-pipeline base port so the two RolloutManager actors do
-        # not race for the same port window.
-        "MILES_ROLLOUT_BASE_PORT": str(15000 + pipeline_index * 1000),
-    }
-    if pythonpath := os.environ.get("PYTHONPATH"):
-        pipeline_runtime_env_vars["PYTHONPATH"] = pythonpath
-    for _k in (
-        "MILES_TMS_HOOK_MODE",
-        "MILES_SKIP_TMS_PAUSE",
-        "MILES_SKIP_NODE_PG_PIN",
-        "TMS_INIT_ENABLE_CPU_BACKUP",
-        "CUDA_DEVICE_MAX_CONNECTIONS",
-        "NCCL_NVLS_ENABLE",
-    ):
-        if (_v := os.environ.get(_k)) is not None:
-            pipeline_runtime_env_vars[_k] = _v
+    pipeline_runtime_env_vars = build_pipeline_runtime_env(
+        pipeline_id,
+        pipeline_namespace,
+        # Per-pipeline base port so the two RolloutManager actors do not race
+        # for the same port window.
+        extra={"MILES_ROLLOUT_BASE_PORT": str(15000 + pipeline_index * 1000)},
+    )
 
     coordinator = (
         ray.remote(MilesCoordinator)
@@ -340,8 +349,6 @@ def main():
     """
     import asyncio
     import logging
-    from dataclasses import dataclass, field
-    from typing import Any, Optional
 
     import ray
 
@@ -366,18 +373,6 @@ def main():
     assert_rlix_topology(
         base_args, sglang_config=getattr(base_args, "sglang_config", None)
     )
-
-    # --- Pipeline config dataclass with cluster_device_mappings field ---
-    @dataclass
-    class MilesPipelineConfig:
-        miles_args: Any
-        sglang_config: Optional[Any] = None
-        verify_model_after_sync: bool = False
-        num_gpus_per_node: int = 8
-        system_envs: dict = field(default_factory=dict)
-        # M11.2 — cluster_device_mappings flow into MilesPipeline so
-        # _build_placement_provider can use per-pipeline physical GPUs.
-        cluster_device_mappings: dict = field(default_factory=dict)
 
     # --- Topology: explicit overlap (env-driven) OR fallback disjoint -----
     # Real M11.2 path: set MILES_DUAL_P1_TRAIN / P1_INFER / P2_TRAIN / P2_INFER
