@@ -1,19 +1,17 @@
-"""M11.2 dual-pipeline driver — `examples/rlix/run_miles_dual.py`.
+"""RLix dual-pipeline example driver — `examples/rlix/run_miles_dual.py`.
 
 Spawns two MilesCoordinator + MilesPipeline pairs in separate Ray
-namespaces with disjoint ``cluster_device_mappings``. Each pipeline
-runs its own ``rlix_train_loop`` concurrently via ``asyncio.gather``.
+namespaces and runs their training loops concurrently. The first loop to
+raise cancels its peer (see ``main``'s ``asyncio.wait`` / cancel handling)
+so both settle and release their scheduler allocations cleanly.
 
-Topology (Codex-recommended Option A — disjoint pools, no cross-pipeline
-GPU contention):
-    pipeline 1: actor_train=[0,1], actor_infer=[0,1]
-    pipeline 2: actor_train=[2,3], actor_infer=[2,3]
-
-This is the minimum-viable M11.2 PASS — proves two pipelines can register
-+ initialize + train + sync + generate + clean up concurrently without
-namespace, actor-name, port, or scheduler-ledger collisions. It does NOT
-exercise cross-pipeline preemption (Option B/C — overlap topology — needs
-the deferred F22 shell-init contract per ``miles_pipeline.py:14-33``).
+GPU topology is one of:
+- disjoint (default): the physical pool is split into two non-overlapping
+  per-pipeline pools — see ``_split_pools_for_dual``;
+- explicit (overlap-capable): set all four
+  ``MILES_DUAL_P*_{TRAIN,INFER}`` env vars to map each pipeline onto
+  specific physical GPUs, which may overlap across pipelines — see
+  ``_overlap_pools_from_env``.
 
 Per-pipeline isolation that this driver enforces:
 - Distinct pipeline IDs from ``orchestrator.allocate_pipeline_id``
@@ -29,26 +27,55 @@ Per-pipeline isolation that this driver enforces:
 - W&B / TensorBoard / Prometheus disabled (``--use-wandb`` etc must be
   unset); per-pipeline tracking re-enable is M11.3 follow-up
 
-Per scope F13 the driver MUST NOT have a top-level ``try/except`` and
-MUST NOT call ``ray.shutdown()``: failure semantics = let exceptions
-propagate naturally → driver exits → user runs ``ray stop`` to clean up.
+Failure semantics: the driver has no top-level ``try/except`` and does not
+call ``ray.shutdown()`` — exceptions propagate, the driver exits, and the
+user runs ``ray stop`` to clean up.
 """
 
 from __future__ import annotations
 
 import copy
+import logging
 import os
-import sys
+from dataclasses import dataclass
+from typing import Any
 
-# F08 / F41 — fail fast if RLix entry is invoked without the env var.
-# The check must happen BEFORE any heavy import (torch / sglang /
-# megatron) so CVD has a chance to take effect via Ray runtime_env.
-if os.environ.get("RLIX_CONTROL_PLANE") != "rlix":
-    sys.stderr.write(
-        "examples/rlix/run_miles_dual.py requires RLIX_CONTROL_PLANE=rlix.\n"
-        "    RLIX_CONTROL_PLANE=rlix python -m examples.rlix.run_miles_dual ...\n"
+# Support both `python -m examples.rlix.run_miles_dual` (package context) and
+# `python examples/rlix/run_miles_dual.py` (direct script, no parent package).
+try:
+    from ._common import (
+        MilesPipelineConfig,
+        build_pipeline_runtime_env,
+        require_rlix_control_plane,
     )
-    sys.exit(2)
+except ImportError:
+    from _common import (
+        MilesPipelineConfig,
+        build_pipeline_runtime_env,
+        require_rlix_control_plane,
+    )
+
+# Fail fast before any heavy import (torch / sglang / megatron) so per-actor
+# CUDA_VISIBLE_DEVICES can take effect via Ray runtime_env.
+require_rlix_control_plane(
+    "examples/rlix/run_miles_dual.py", "examples.rlix.run_miles_dual"
+)
+
+logger = logging.getLogger("run_miles_dual")
+
+
+@dataclass
+class PipelineHandle:
+    """One pipeline's actors + handles, populated across build and setup."""
+
+    index: int
+    pipeline_id: str
+    namespace: str
+    coordinator: Any
+    pipeline: Any
+    args: Any
+    train_group: Any = None
+    rollout_manager: Any = None
 
 
 def _split_pools_for_dual(
@@ -113,8 +140,9 @@ def _overlap_pools_from_env(num_gpus_per_node: int) -> (
     """Read per-pipeline mappings from ``MILES_DUAL_*`` env vars.
 
     Returns ``((p1_train, p1_infer), (p2_train, p2_infer))`` if **all four**
-    env vars are set; otherwise ``None`` (caller falls back to
-    ``_split_pools_for_dual``). Validates:
+    env vars are set, or ``None`` if **none** are set (caller falls back to
+    ``_split_pools_for_dual``). A partial set raises ``ValueError`` so a typo
+    or missing var cannot silently switch the topology. Validates:
       - each GPU id is in ``[0, num_gpus_per_node)``
       - per-pipeline ``train ⊆ infer`` (partial-overlap inside pipeline)
       - no duplicate IDs within a single mapping
@@ -122,12 +150,23 @@ def _overlap_pools_from_env(num_gpus_per_node: int) -> (
     here; the harness ``grep_overlap_log.sh`` asserts the overlap-non-empty
     condition end-to-end.
     """
-    p1_train = _parse_gpu_list("MILES_DUAL_P1_TRAIN")
-    p1_infer = _parse_gpu_list("MILES_DUAL_P1_INFER")
-    p2_train = _parse_gpu_list("MILES_DUAL_P2_TRAIN")
-    p2_infer = _parse_gpu_list("MILES_DUAL_P2_INFER")
-    if None in (p1_train, p1_infer, p2_train, p2_infer):
+    env_names = (
+        "MILES_DUAL_P1_TRAIN", "MILES_DUAL_P1_INFER",
+        "MILES_DUAL_P2_TRAIN", "MILES_DUAL_P2_INFER",
+    )
+    mappings = [_parse_gpu_list(name) for name in env_names]
+    present = [name for name, m in zip(env_names, mappings) if m is not None]
+    if not present:
         return None
+    if len(present) != len(env_names):
+        # All-or-nothing: a partial set is almost always a typo or a missing
+        # var, which would silently fall back to disjoint topology.
+        missing = [name for name in env_names if name not in present]
+        raise ValueError(
+            f"MILES_DUAL_* overlap mapping requires all four env vars; "
+            f"set={present} missing={missing}"
+        )
+    p1_train, p1_infer, p2_train, p2_infer = mappings
     for label, mapping in (
         ("p1_train", p1_train), ("p1_infer", p1_infer),
         ("p2_train", p2_train), ("p2_infer", p2_infer),
@@ -204,13 +243,7 @@ def _build_pipeline(
     train_mapping: list[int],
     infer_mapping: list[int],
     orchestrator,
-    ray,
-    MilesCoordinator,
-    MilesPipelineConfig,
-    get_coordinator_actor_name,
-    get_pipeline_namespace,
-    logger,
-):
+) -> PipelineHandle:
     """Allocate one pipeline_id, register, admit, create coordinator+pipeline.
 
     ``train_mapping`` / ``infer_mapping`` are the EXPLICIT physical GPU
@@ -219,8 +252,15 @@ def _build_pipeline(
     partial-overlap invariant is asserted; cross-pipeline overlap is
     asserted by ``grep_overlap_log.sh`` end-to-end.
 
-    Returns ``(pipeline_id, namespace, coordinator_handle, pipeline_handle, args)``.
+    Returns a :class:`PipelineHandle`.
     """
+    import ray
+    from rlix.pipeline.miles_coordinator import MilesCoordinator
+    from rlix.protocol.types import (
+        get_coordinator_actor_name,
+        get_pipeline_namespace,
+    )
+
     pipeline_id = ray.get(orchestrator.allocate_pipeline_id.remote("miles"))
     pipeline_namespace = get_pipeline_namespace(pipeline_id)
 
@@ -277,26 +317,13 @@ def _build_pipeline(
         cluster_device_mappings=cluster_device_mappings,
     )
 
-    pipeline_runtime_env_vars = {
-        "PIPELINE_ID": str(pipeline_id),
-        "ROLL_RAY_NAMESPACE": pipeline_namespace,
-        "RLIX_CONTROL_PLANE": "rlix",
-        # Per-pipeline base port so the two RolloutManager actors do
-        # not race for the same port window.
-        "MILES_ROLLOUT_BASE_PORT": str(15000 + pipeline_index * 1000),
-    }
-    if pythonpath := os.environ.get("PYTHONPATH"):
-        pipeline_runtime_env_vars["PYTHONPATH"] = pythonpath
-    for _k in (
-        "MILES_TMS_HOOK_MODE",
-        "MILES_SKIP_TMS_PAUSE",
-        "MILES_SKIP_NODE_PG_PIN",
-        "TMS_INIT_ENABLE_CPU_BACKUP",
-        "CUDA_DEVICE_MAX_CONNECTIONS",
-        "NCCL_NVLS_ENABLE",
-    ):
-        if (_v := os.environ.get(_k)) is not None:
-            pipeline_runtime_env_vars[_k] = _v
+    pipeline_runtime_env_vars = build_pipeline_runtime_env(
+        pipeline_id,
+        pipeline_namespace,
+        # Per-pipeline base port so the two RolloutManager actors do not race
+        # for the same port window.
+        extra={"MILES_ROLLOUT_BASE_PORT": str(15000 + pipeline_index * 1000)},
+    )
 
     coordinator = (
         ray.remote(MilesCoordinator)
@@ -331,7 +358,14 @@ def _build_pipeline(
         pipeline_index, pipeline_id,
     )
 
-    return pipeline_id, pipeline_namespace, coordinator, pipeline, args
+    return PipelineHandle(
+        index=pipeline_index,
+        pipeline_id=pipeline_id,
+        namespace=pipeline_namespace,
+        coordinator=coordinator,
+        pipeline=pipeline,
+        args=args,
+    )
 
 
 def main():
@@ -339,9 +373,6 @@ def main():
     guard above fires before transitive ``import torch`` / ``import sglang``.
     """
     import asyncio
-    import logging
-    from dataclasses import dataclass, field
-    from typing import Any, Optional
 
     import ray
 
@@ -349,16 +380,10 @@ def main():
     from miles.utils.logging_utils import configure_logger
     from miles.utils.rlix_train_loop import run_async_train_loop
     from miles.utils.rlix_validation import assert_rlix_topology
-    from rlix.pipeline.miles_coordinator import MilesCoordinator
-    from rlix.protocol.types import (
-        get_coordinator_actor_name,
-        get_pipeline_namespace,
-    )
 
     import rlix
 
     configure_logger()
-    logger = logging.getLogger("run_miles_dual")
     base_args = parse_args()
 
     # F10 startup fail-fast on the BASE args. Per-pipeline arg overrides
@@ -366,18 +391,6 @@ def main():
     assert_rlix_topology(
         base_args, sglang_config=getattr(base_args, "sglang_config", None)
     )
-
-    # --- Pipeline config dataclass with cluster_device_mappings field ---
-    @dataclass
-    class MilesPipelineConfig:
-        miles_args: Any
-        sglang_config: Optional[Any] = None
-        verify_model_after_sync: bool = False
-        num_gpus_per_node: int = 8
-        system_envs: dict = field(default_factory=dict)
-        # M11.2 — cluster_device_mappings flow into MilesPipeline so
-        # _build_placement_provider can use per-pipeline physical GPUs.
-        cluster_device_mappings: dict = field(default_factory=dict)
 
     # --- Topology: explicit overlap (env-driven) OR fallback disjoint -----
     # Real M11.2 path: set MILES_DUAL_P1_TRAIN / P1_INFER / P2_TRAIN / P2_INFER
@@ -425,12 +438,6 @@ def main():
         train_mapping=p1_train,
         infer_mapping=p1_infer,
         orchestrator=orchestrator,
-        ray=ray,
-        MilesCoordinator=MilesCoordinator,
-        MilesPipelineConfig=MilesPipelineConfig,
-        get_coordinator_actor_name=get_coordinator_actor_name,
-        get_pipeline_namespace=get_pipeline_namespace,
-        logger=logger,
     )
     p2 = _build_pipeline(
         base_args=base_args,
@@ -438,62 +445,57 @@ def main():
         train_mapping=p2_train,
         infer_mapping=p2_infer,
         orchestrator=orchestrator,
-        ray=ray,
-        MilesCoordinator=MilesCoordinator,
-        MilesPipelineConfig=MilesPipelineConfig,
-        get_coordinator_actor_name=get_coordinator_actor_name,
-        get_pipeline_namespace=get_pipeline_namespace,
-        logger=logger,
     )
 
-    pipelines = [p1, p2]
+    handles = [p1, p2]
 
     # ---- 3. Pull handles for each pipeline. ------------------------------
-    handles = []
-    for pid, ns, coord, pipe, args in pipelines:
-        train_group = ray.get(pipe.get_train_group.remote())
-        rollout_manager = ray.get(pipe.get_rollout_manager.remote())
-        engine_count = int(ray.get(pipe.get_declared_engine_count.remote()))
+    for h in handles:
+        h.train_group = ray.get(h.pipeline.get_train_group.remote())
+        h.rollout_manager = ray.get(h.pipeline.get_rollout_manager.remote())
+        engine_count = int(ray.get(h.pipeline.get_declared_engine_count.remote()))
         logger.info(
             "[run_miles_dual] handles ready pipeline_id=%s engines=%d",
-            pid, engine_count,
+            h.pipeline_id, engine_count,
         )
-        handles.append((pid, ns, coord, pipe, args, train_group, rollout_manager))
 
-    # ---- 4. Drive 2 concurrent rlix_train_loops via asyncio.gather. -----
-    async def _run_one_pipeline(idx, pid, pipe, args, train_group, rollout_manager):
+    # ---- 4. Drive 2 concurrent rlix_train_loops. ------------------------
+    async def _run_one_pipeline(h: PipelineHandle):
         async def _before(step: int) -> None:
-            await pipe.before_training.remote(step)
+            await h.pipeline.before_training.remote(step)
 
         async def _after(step: int) -> None:
-            await pipe.after_training.remote(step)
+            await h.pipeline.after_training.remote(step)
 
         async def _release_only(step: int) -> None:
-            # R04-F1 cleanup hook: releases actor_train allocation only.
-            await pipe.release_train_only.remote(step)
+            # Cleanup hook: releases actor_train allocation only.
+            await h.pipeline.release_train_only.remote(step)
 
         # Per-rollout step_target = rollout_batch_size. See
         # MilesPipeline.signal_rollout_demand docstring for why pre-signalling
         # demand to the scheduler is required for 4-GPU 2-pipeline full
         # cross-overlap (without it, rollout 2+ hangs when both pipelines
         # release all DP workers between rollouts).
-        _step_target = int(getattr(args, "rollout_batch_size", 0) or 0)
+        _step_target = int(getattr(h.args, "rollout_batch_size", 0) or 0)
 
         async def _signal_demand(rollout_id: int) -> None:
             if _step_target <= 0:
                 return
-            await pipe.signal_rollout_demand.remote(rollout_id, _step_target)
+            await h.pipeline.signal_rollout_demand.remote(rollout_id, _step_target)
 
         await run_async_train_loop(
-            args,
-            train_group=train_group,
-            rollout_manager=rollout_manager,
+            h.args,
+            train_group=h.train_group,
+            rollout_manager=h.rollout_manager,
             before_step=_before,
             after_step=_after,
             release_only=_release_only,
             signal_demand=_signal_demand,
         )
-        logger.info("[run_miles_dual] mp%d training loop complete pipeline_id=%s", idx, pid)
+        logger.info(
+            "[run_miles_dual] mp%d training loop complete pipeline_id=%s",
+            h.index, h.pipeline_id,
+        )
 
     async def _async_main():
         # F4 fix (m11-review.review-report.md §2): use create_task + wait(
@@ -505,13 +507,7 @@ def main():
         # so Phase 1's try/finally inside run_async_train_loop fires
         # release_only on the CancelledError path and the scheduler
         # ledger stays consistent.
-        tasks = [
-            asyncio.create_task(
-                _run_one_pipeline(i + 1, pid, pipe, args, train_group, rollout_manager)
-            )
-            for i, (pid, ns, coord, pipe, args, train_group, rollout_manager)
-            in enumerate(handles)
-        ]
+        tasks = [asyncio.create_task(_run_one_pipeline(h)) for h in handles]
         try:
             done, pending = await asyncio.wait(
                 tasks, return_when=asyncio.FIRST_EXCEPTION
@@ -544,13 +540,13 @@ def main():
             # original training exception. Codex Phase 7 review MEDIUM.
             try:
                 shutdown_refs = [
-                    pipe.shutdown_hard.remote() for _, _, _, pipe, _, _, _ in handles
+                    h.pipeline.shutdown_hard.remote() for h in handles
                 ]
                 ray.get(shutdown_refs, timeout=60.0)
-                for pid, _, _, _, _, _, _ in handles:
+                for h in handles:
                     logger.info(
                         "[run_miles_dual] shutdown_hard complete pipeline_id=%s",
-                        pid,
+                        h.pipeline_id,
                     )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(

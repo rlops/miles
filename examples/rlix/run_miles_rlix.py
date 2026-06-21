@@ -14,18 +14,19 @@ propagate naturally → driver exits → user runs ``ray stop`` to clean up.
 from __future__ import annotations
 
 import os
-import sys
 
-# F08 / F41 — fail fast if RLix entry is invoked without the env var.
-# The check must happen BEFORE any heavy import (torch / sglang /
-# megatron) so CVD has a chance to take effect via Ray runtime_env.
-if os.environ.get("RLIX_CONTROL_PLANE") != "rlix":
-    sys.stderr.write(
-        "examples/rlix/run_miles_rlix.py requires RLIX_CONTROL_PLANE=rlix.\n"
-        "Use train_async.py for standalone runs, or set the env var:\n"
-        "    RLIX_CONTROL_PLANE=rlix python -m examples.rlix.run_miles_rlix ...\n"
-    )
-    sys.exit(2)
+# Support both `python -m examples.rlix.run_miles_rlix` (package context) and
+# `python examples/rlix/run_miles_rlix.py` (direct script, no parent package).
+try:
+    from ._common import require_rlix_control_plane
+except ImportError:
+    from _common import require_rlix_control_plane
+
+# Fail fast before any heavy import (torch / sglang / megatron) so per-actor
+# CUDA_VISIBLE_DEVICES can take effect via Ray runtime_env.
+require_rlix_control_plane(
+    "examples/rlix/run_miles_rlix.py", "examples.rlix.run_miles_rlix"
+)
 
 
 def _build_cluster_device_mappings(args) -> dict[str, list[int]]:
@@ -52,8 +53,6 @@ def main():
     """
     import asyncio
     import logging
-    from dataclasses import dataclass, field
-    from typing import Any, Optional
 
     import ray
 
@@ -69,6 +68,11 @@ def main():
     )
 
     import rlix
+
+    try:
+        from ._common import MilesPipelineConfig, build_pipeline_runtime_env
+    except ImportError:
+        from _common import MilesPipelineConfig, build_pipeline_runtime_env
 
     configure_logger()
     logger = logging.getLogger("run_miles_rlix")
@@ -137,16 +141,6 @@ def main():
     )
 
     # ---- 3. Build the MilesPipelineConfig wrapper. ---------------------------
-    @dataclass
-    class MilesPipelineConfig:
-        miles_args: Any
-        sglang_config: Optional[Any] = None
-        verify_model_after_sync: bool = False
-        num_gpus_per_node: int = 8
-        # ``system_envs`` is writeable so MilesCoordinator._inject_pipeline_env_vars
-        # can mutate the deepcopy without hitting a frozen-dataclass error.
-        system_envs: dict = field(default_factory=dict)
-
     # ``num_gpus_per_node`` defaults to actor_num_gpus_per_node when the
     # arg is absent; RLix uses this for placement-group bundle sizing.
     cfg = MilesPipelineConfig(
@@ -166,26 +160,11 @@ def main():
     # so we propagate the identity vars via Ray runtime_env. Also set them on
     # the driver's own env so any later in-driver roll import (e.g. via the
     # placement provider) finds them.
-    pipeline_runtime_env_vars = {
-        "PIPELINE_ID": str(pipeline_id),
-        "ROLL_RAY_NAMESPACE": pipeline_namespace,
-        "RLIX_CONTROL_PLANE": "rlix",
-    }
-    if pythonpath := os.environ.get("PYTHONPATH"):
-        pipeline_runtime_env_vars["PYTHONPATH"] = pythonpath
-    # Forward smoke-only escape hatches so MilesCoordinator + child actors
-    # see them when reading os.environ (Ray runtime_env does not propagate
-    # the parent driver's env by default).
-    for _k in (
-        "MILES_TMS_HOOK_MODE",
-        "MILES_SKIP_TMS_PAUSE",
-        "MILES_SKIP_NODE_PG_PIN",
-        "TMS_INIT_ENABLE_CPU_BACKUP",
-        "CUDA_DEVICE_MAX_CONNECTIONS",
-        "NCCL_NVLS_ENABLE",
-    ):
-        if (_v := os.environ.get(_k)) is not None:
-            pipeline_runtime_env_vars[_k] = _v
+    pipeline_runtime_env_vars = build_pipeline_runtime_env(
+        pipeline_id, pipeline_namespace
+    )
+    # Also set the identity vars on the driver's own env so any later
+    # in-driver roll import (e.g. via the placement provider) finds them.
     os.environ["PIPELINE_ID"] = str(pipeline_id)
     os.environ["ROLL_RAY_NAMESPACE"] = pipeline_namespace
     # Name + namespace must match how the rlix scheduler resolves this
