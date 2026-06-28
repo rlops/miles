@@ -250,15 +250,12 @@ eval:
 
     extra_env_vars = misc_env_vars
     if args.train_backend == "megatron":
-        import os
-
-        nvlink_count = os.popen('nvidia-smi topo -m 2>/dev/null | grep -o "NV[0-9][0-9]*" | wc -l').read().strip()
-        has_nvlink = "1" if int(nvlink_count or "0") > 0 else "0"
+        from miles.utils.nvlink_utils import has_nvlink
 
         extra_env_vars |= {
             "PYTHONPATH": args.megatron_path,
             "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-            "NCCL_NVLS_ENABLE": has_nvlink,
+            "NCCL_NVLS_ENABLE": "1" if has_nvlink() else "0",
         }
 
     extra_env_vars |= true_on_policy_envs

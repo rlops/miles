@@ -201,8 +201,9 @@ def _parse_extra_env_vars(text: str):
 
 
 def check_has_nvlink():
-    output = exec_command("nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l", capture_output=True)
-    return int(output) > 0
+    from miles.utils.nvlink_utils import has_nvlink
+
+    return has_nvlink()
 
 
 def get_default_wandb_args(test_file: str, run_name_prefix: str | None = None, run_id: str | None = None):
