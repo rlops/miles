@@ -719,8 +719,8 @@ class SGLangEngine(RayActor):
         callers can log it.
 
         Notes:
-        - ``threshold_gb`` is typically
-          ``args.miles_post_sleep_vram_threshold_gb`` (default 1.0 GiB).
+        - ``threshold_gb`` is the fixed post-sleep handoff floor
+          ``RolloutManager.POST_SLEEP_VRAM_THRESHOLD_GB`` (1.0 GiB).
         - On non-rank-0 nodes this is a no-op returning ``0.0``.
         """
         if self.node_rank != 0:
