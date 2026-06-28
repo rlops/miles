@@ -1686,17 +1686,6 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
-                "--miles-post-sleep-vram-threshold-gb",
-                type=float,
-                default=1.0,
-                help=(
-                    "Post-sleep / post-offload SGLang server-side VRAM threshold in GiB "
-                    "(read from /server_info `memory_usage`). Anti-regression invariant "
-                    "#8: assert below this value after every sleep / release_memory_occupation "
-                    "to detect torch_memory_saver leak before the next training step."
-                ),
-            )
-            parser.add_argument(
                 "--model-update-transport",
                 type=str,
                 default="cuda_ipc",

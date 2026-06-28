@@ -53,6 +53,14 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
+# Post-sleep VRAM ceiling (GiB) asserted after shrink_engines releases an
+# engine's weights/KV/cuda_graph. A colocated GPU is time-shared — only one of
+# train/infer holds VRAM at a time — so a full release_memory_occupation MUST
+# drop residency to near-zero; anything above this means torch_memory_saver
+# leaked (Anti-regression invariant #8). This is the handoff correctness floor,
+# not a tuning knob, so it is a fixed constant rather than a parameter/arg.
+POST_SLEEP_VRAM_THRESHOLD_GB = 1.0
+
 
 # ---------------------------------------------------------------------------
 # F2 EngineInfo — RLix-mode 5-state machine (single source of truth)
@@ -927,8 +935,6 @@ class RolloutManager:
     def shrink_engines(
         self,
         engine_indices: Iterable[int],
-        *,
-        post_sleep_vram_threshold_gb: float | None = None,
     ) -> list[int]:
         """F2 abort-drain-sleep ordering for a subset of active engines.
 
@@ -938,8 +944,8 @@ class RolloutManager:
           3. Drain via ``is_idle`` poll until every target reports zero
              outstanding requests.
           4. ``release_memory_occupation()`` to release weights/KV/graph.
-          5. Optional: assert post-sleep VRAM below threshold (Anti-regression
-             invariant #8).
+          5. Assert post-sleep VRAM below POST_SLEEP_VRAM_THRESHOLD_GB
+             (Anti-regression invariant #8).
           6. Mark each target ``disabling → offloaded``.
 
         Returns the sorted list of engine indices actually shrunk.
@@ -1031,16 +1037,18 @@ class RolloutManager:
                     )
             # Step 4: release memory.
             ray.get([h.release_memory_occupation.remote(tags=None) for h in handles])
-            # Step 5: optional post-sleep VRAM assert.
-            if post_sleep_vram_threshold_gb is not None:
-                ray.get(
-                    [
-                        h.assert_post_sleep_vram_below_threshold.remote(
-                            threshold_gb=post_sleep_vram_threshold_gb
-                        )
-                        for h in handles
-                    ]
-                )
+            # Step 5: post-sleep VRAM assert. A colocated GPU is time-shared, so
+            # a full release MUST drop residency below the handoff floor; this
+            # runs unconditionally to catch any torch_memory_saver leak before
+            # the next phase reclaims the GPU.
+            ray.get(
+                [
+                    h.assert_post_sleep_vram_below_threshold.remote(
+                        threshold_gb=POST_SLEEP_VRAM_THRESHOLD_GB
+                    )
+                    for h in handles
+                ]
+            )
         except Exception:
             # Reset the abort cache on failure so retry re-aborts new
             # in-flights that arrived during the failed cycle.
