@@ -617,7 +617,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if not hasattr(self, "_cpu_bucket_cache") or self._cpu_bucket_cache is None:
             from .update_weight.cpu_bucket_cache import CPUBucketCache
 
-            max_bytes = int(getattr(self.args, "miles_model_update_bucket_size_mb", 512)) * 1024 * 1024
+            max_bytes = int(self.args.miles_model_update_bucket_size_mb) * 1024 * 1024
             self._cpu_bucket_cache = CPUBucketCache(max_bucket_size_bytes=max_bytes)
             # F20: bucket build / sync session each acquire this lock for
             # the whole critical section (single-method-single-critical-

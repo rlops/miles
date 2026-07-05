@@ -360,9 +360,7 @@ def assert_rlix_topology(args: Any, sglang_config: Any | None = None) -> None:
         )
 
     # --- S2: bucket size <= post-wake free VRAM (NCCL broadcast / cuda_ipc paths)
-    bucket_size_bytes = (
-        int(getattr(args, "miles_model_update_bucket_size_mb", 512) or 512) * 1024 * 1024
-    )
+    bucket_size_bytes = int(args.miles_model_update_bucket_size_mb) * 1024 * 1024
     transport = getattr(args, "model_update_transport", "cuda_ipc")
     has_gpu_staging = _topology_has_non_colocate_engines(args) or transport == "cuda_ipc"
     if has_gpu_staging:
