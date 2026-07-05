@@ -178,6 +178,8 @@ def main():
     # the parent driver's env by default).
     for _k in (
         "MILES_TMS_HOOK_MODE",
+        "MILES_TMS_ALLOW_PRELOAD_ON_BLACKWELL",
+        "MILES_MAX_RESIDUAL_GPU_MEM_GB",
         "MILES_SKIP_TMS_PAUSE",
         "MILES_SKIP_NODE_PG_PIN",
         "TMS_INIT_ENABLE_CPU_BACKUP",

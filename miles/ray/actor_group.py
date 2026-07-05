@@ -125,9 +125,15 @@ class RayTrainGroup:
             # Per-actor switch into torch_memory_saver "torch" hook mode
             # (CUDAPluggableAllocator) which avoids the LD_PRELOAD libc
             # malloc hook that segfaults during build_cpu_bucket_cache on
-            # CUDA 12.9 / Blackwell. The actor reads this env at init.
+            # Blackwell with pre-CUDA-13 wheels (the guard is CUDA-version
+            # aware: preload is allowed on cu13+ Blackwell). The actor
+            # reads this env at init.
             if (mode := _os.environ.get("MILES_TMS_HOOK_MODE")):
                 env_vars_base["MILES_TMS_HOOK_MODE"] = mode
+            # The guard's escape hatch is read inside the actor process;
+            # forward it so it works under Ray runtime_env isolation.
+            if (allow := _os.environ.get("MILES_TMS_ALLOW_PRELOAD_ON_BLACKWELL")):
+                env_vars_base["MILES_TMS_ALLOW_PRELOAD_ON_BLACKWELL"] = allow
 
         backend = self.args.train_backend
         if backend == "megatron":
@@ -219,6 +225,12 @@ class RayTrainGroup:
             env_vars["LD_PRELOAD"] = dynlib_path
             env_vars["TMS_INIT_ENABLE"] = "1"
             env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
+            # Forward MILES_TMS_HOOK_MODE for consistency with the
+            # placement path above (_allocate_gpus_via_placements).
+            if (mode := os.environ.get("MILES_TMS_HOOK_MODE")):
+                env_vars["MILES_TMS_HOOK_MODE"] = mode
+            if (allow := os.environ.get("MILES_TMS_ALLOW_PRELOAD_ON_BLACKWELL")):
+                env_vars["MILES_TMS_ALLOW_PRELOAD_ON_BLACKWELL"] = allow
 
         backend = self.args.train_backend
         if backend == "megatron":

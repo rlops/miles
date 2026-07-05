@@ -98,8 +98,10 @@ class MegatronTrainRayActor(TrainRayActor):
             # MILES_TMS_HOOK_MODE=torch switches torch_memory_saver into
             # PyTorch's CUDAPluggableAllocator path, avoiding the
             # LD_PRELOAD libc malloc hook that segfaults during
-            # build_cpu_bucket_cache on CUDA 12.9 / Blackwell. Must be
-            # set BEFORE any tms call that triggers _ensure_initialized.
+            # build_cpu_bucket_cache on Blackwell with pre-CUDA-13 wheels.
+            # The guard below is CUDA-version-aware: preload is allowed on
+            # cu13+ Blackwell. Must be set BEFORE any tms call that
+            # triggers _ensure_initialized.
             import os as _os
 
             mode = _os.environ.get("MILES_TMS_HOOK_MODE")
