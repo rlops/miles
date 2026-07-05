@@ -15,6 +15,7 @@ from urllib3.exceptions import NewConnectionError
 
 from miles.backends.megatron_utils.lora_utils import LORA_ADAPTER_NAME, convert_target_modules_to_hf, is_lora_enabled
 from miles.ray.ray_actor import RayActor
+from miles.utils.gpu_probe import query_process_tree_gpu_used_gb
 from miles.utils.env_report import collect_and_print_node_env_report
 from miles.utils.http_utils import get_host_info
 
@@ -755,6 +756,70 @@ class SGLangEngine(RayActor):
                 f"have leaked. Check release_memory_occupation tags."
             )
         return observed_max_gb
+
+    def _server_info_residual_gb(self, timeout_s: float = 5.0):
+        """SGLang /server_info weight+kvcache+graph, max across DPs (GiB).
+
+        This is *accounting* (KV static-pool size). It does NOT drop after a
+        torch_memory_saver pause, so it is logged for diagnostics only and is
+        never used as a hard gate. Returns None if unavailable.
+        """
+        try:
+            body = self.get_server_info()
+        except Exception:
+            return None
+        internal_states = body.get("internal_states") if isinstance(body, dict) else None
+        if not isinstance(internal_states, list) or not internal_states:
+            return None
+        observed_max_gb = 0.0
+        for state in internal_states:
+            mem = state.get("memory_usage") if isinstance(state, dict) else None
+            if not isinstance(mem, dict):
+                continue
+            total_gb = sum(float(mem.get(k, 0.0) or 0.0) for k in ("weight", "kvcache", "graph"))
+            observed_max_gb = max(observed_max_gb, total_gb)
+        return observed_max_gb
+
+    def log_post_sleep_residual_diagnostics(
+        self, threshold_gb: float | None = None, timeout_s: float = 5.0
+    ):
+        """Log attribution diagnostics after ``release_memory_occupation``.
+
+        The hard residual gate is whole-GPU ``memory.used`` in RLix. This
+        engine-side diagnostic still records this SGLang process tree's real
+        resident GPU memory and ``/server_info`` accounting so high whole-GPU
+        residual can be attributed to SGLang vs non-SGLang co-tenants.
+
+        Returns the measured process-resident GiB, or ``None`` when
+        unmeasurable (nvidia-smi missing / PID-namespace mismatch).
+        """
+        if self.node_rank != 0:
+            return None
+        _log = logging.getLogger(__name__)
+        account_gb = self._server_info_residual_gb(timeout_s=timeout_s)
+        root = getattr(self, "process", None)
+        resident_gb = query_process_tree_gpu_used_gb(
+            getattr(root, "pid", None), timeout_s=timeout_s
+        )
+        _log.info(
+            "post-sleep residual diagnostic engine=%s:%s "
+            "process_resident=%s GiB "
+            "server_info_accounting(weight+kvcache+graph)=%s GiB "
+            "whole_gpu_threshold=%s GiB",
+            self.server_host,
+            self.server_port,
+            ("%.3f" % resident_gb) if resident_gb is not None else "n/a",
+            ("%.3f" % account_gb) if account_gb is not None else "n/a",
+            ("%.3f" % float(threshold_gb)) if threshold_gb is not None else "n/a",
+        )
+        if resident_gb is None:
+            _log.warning(
+                "post-sleep process-resident diagnostic unavailable on engine "
+                "%s:%s (nvidia-smi missing or PID-namespace mismatch).",
+                self.server_host,
+                self.server_port,
+            )
+        return resident_gb
 
     def resume_memory_occupation(self, tags: list[str] = None):
         """

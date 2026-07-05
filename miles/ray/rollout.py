@@ -1031,15 +1031,30 @@ class RolloutManager:
                     )
             # Step 4: release memory.
             ray.get([h.release_memory_occupation.remote(tags=None) for h in handles])
-            # Step 5: optional post-sleep VRAM assert.
+            # Step 5: attribution diagnostics. The hard residual gate is
+            # whole-GPU memory.used in RLix; this logs each SGLang engine's
+            # process-resident memory and /server_info accounting so a high
+            # whole-GPU residual can be attributed to SGLang vs non-SGLang
+            # co-tenants (Megatron/Miles/vLLM/orphan processes).
             if post_sleep_vram_threshold_gb is not None:
-                ray.get(
+                observed_resident_gbs = ray.get(
                     [
-                        h.assert_post_sleep_vram_below_threshold.remote(
+                        h.log_post_sleep_residual_diagnostics.remote(
                             threshold_gb=post_sleep_vram_threshold_gb
                         )
                         for h in handles
                     ]
+                )
+                measured = [v for v in observed_resident_gbs if v is not None]
+                logger.info(
+                    "shrink_engines: post-sleep SGLang residual diagnostics "
+                    "process_resident_max=%s GiB per_engine=%s "
+                    "whole_gpu_threshold=%.3f GiB engine_indices=%s "
+                    "(whole-GPU hard gate runs in RLix)",
+                    ("%.3f" % max(measured)) if measured else "n/a",
+                    [None if v is None else round(float(v), 3) for v in observed_resident_gbs],
+                    float(post_sleep_vram_threshold_gb),
+                    indices,
                 )
         except Exception:
             # Reset the abort cache on failure so retry re-aborts new
