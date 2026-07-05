@@ -21,11 +21,15 @@ Design notes (per scope F33 / F102 / F35):
   (length == ``rollout_num_gpus // rollout_num_gpus_per_engine``). Init
   bootstrap (iter 26) creates every engine; runtime expand activates
   subsets.
-- F33: SGLang ``base_gpu_id`` MUST be 0 in RLix mode. CVD is set per
-  worker (manual via Ray runtime_env), so post-CVD the process sees
-  ``cuda:0..tp-1`` regardless of physical ids. The placement provider
-  records physical ids in ``WorkerPlacement.gpu_ids`` for diagnostics
-  and CVD construction; SGLang itself reads ``base_gpu_id=0``.
+- F33: SGLang ``base_gpu_id`` in RLix mode is the engine's first
+  *physical* GPU id (from ``reordered_gpu_ids``), NOT 0. Unlike the
+  train path, rollout actors are launched with visible devices left
+  unset (``NOSET_VISIBLE_DEVICES_ENV_VARS_LIST``), so no per-worker CVD
+  remapping happens and ``_to_local_gpu_id`` returns the physical id
+  unchanged. The placement provider records physical ids in
+  ``WorkerPlacement.gpu_ids`` for diagnostics. (If rollout actors are
+  later given per-worker CVD like the train path, this note and the
+  SGLang launch must switch to ``base_gpu_id=0`` together.)
 """
 
 from __future__ import annotations
