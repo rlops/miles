@@ -13,7 +13,6 @@ fully_async ``_FatalError`` queue boundary in iter 16).
 """
 
 import argparse
-import os
 from copy import deepcopy
 
 from miles.rollout.base_types import (
@@ -36,13 +35,7 @@ from miles.rollout.generate_utils.tool_call_utils import (
 )
 from miles.utils.http_utils import post
 from miles.utils.misc import load_function
-
-
-def _is_rlix_mode() -> bool:
-    """Mirror miles.utils.rlix_validation.is_rlix_mode without taking the
-    import dependency (multi_turn must remain importable even when the
-    rlix_validation module is absent in legacy installations)."""
-    return os.environ.get("RLIX_CONTROL_PLANE") == "rlix"
+from miles.utils.rlix_validation import is_rlix_mode
 
 
 def _is_scheduler_preempt(output: dict, *, rlix_mode: bool) -> bool:
@@ -83,7 +76,7 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     # (F29 / C17): radix middleware is off, turn-level redispatch
     # requires non-streaming JSON, and partial_rollout has no place in
     # either mode.
-    rlix_mode = _is_rlix_mode()
+    rlix_mode = is_rlix_mode()
     assert not args.partial_rollout, (
         "Partial rollout is not supported in multi_turn.generate (F29 / C17)"
     )
