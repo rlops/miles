@@ -113,8 +113,9 @@ def _overlap_pools_from_env(num_gpus_per_node: int) -> (
     """Read per-pipeline mappings from ``MILES_DUAL_*`` env vars.
 
     Returns ``((p1_train, p1_infer), (p2_train, p2_infer))`` if **all four**
-    env vars are set; otherwise ``None`` (caller falls back to
-    ``_split_pools_for_dual``). Validates:
+    env vars are set, or ``None`` if **none** are set (caller falls back to
+    ``_split_pools_for_dual``). A partial set raises ``ValueError`` so a typo
+    or missing var cannot silently switch the topology. Validates:
       - each GPU id is in ``[0, num_gpus_per_node)``
       - per-pipeline ``train ⊆ infer`` (partial-overlap inside pipeline)
       - no duplicate IDs within a single mapping
@@ -122,12 +123,23 @@ def _overlap_pools_from_env(num_gpus_per_node: int) -> (
     here; the harness ``grep_overlap_log.sh`` asserts the overlap-non-empty
     condition end-to-end.
     """
-    p1_train = _parse_gpu_list("MILES_DUAL_P1_TRAIN")
-    p1_infer = _parse_gpu_list("MILES_DUAL_P1_INFER")
-    p2_train = _parse_gpu_list("MILES_DUAL_P2_TRAIN")
-    p2_infer = _parse_gpu_list("MILES_DUAL_P2_INFER")
-    if None in (p1_train, p1_infer, p2_train, p2_infer):
+    env_names = (
+        "MILES_DUAL_P1_TRAIN", "MILES_DUAL_P1_INFER",
+        "MILES_DUAL_P2_TRAIN", "MILES_DUAL_P2_INFER",
+    )
+    mappings = [_parse_gpu_list(name) for name in env_names]
+    present = [name for name, m in zip(env_names, mappings) if m is not None]
+    if not present:
         return None
+    if len(present) != len(env_names):
+        # All-or-nothing: a partial set is almost always a typo or a missing
+        # var, which would silently fall back to disjoint topology.
+        missing = [name for name in env_names if name not in present]
+        raise ValueError(
+            f"MILES_DUAL_* overlap mapping requires all four env vars; "
+            f"set={present} missing={missing}"
+        )
+    p1_train, p1_infer, p2_train, p2_infer = mappings
     for label, mapping in (
         ("p1_train", p1_train), ("p1_infer", p1_infer),
         ("p2_train", p2_train), ("p2_infer", p2_infer),
