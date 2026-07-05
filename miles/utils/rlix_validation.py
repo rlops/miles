@@ -330,14 +330,6 @@ def assert_rlix_topology(args: Any, sglang_config: Any | None = None) -> None:
             f"infer_device_mapping starting at 0 (got {infer_device_mapping}); "
             f"non-contiguous / custom ordering is a follow-up adapter (F12 / A18)."
         )
-    for engine_index, start in enumerate(range(0, len(infer_device_mapping), per_engine)):
-        group = infer_device_mapping[start : start + per_engine]
-        expected = list(range(group[0], group[0] + per_engine))
-        if group != expected:
-            raise RuntimeError(
-                f"C6-mapping: infer engine {engine_index} must occupy contiguous "
-                f"GPUs in first build; got {group}, expected {expected}"
-            )
 
     # --- C17: RLix mode disables RadixTreeMiddleware (partial_rollout + radix_tree forbidden)
     middleware_paths = getattr(args, "miles_router_middleware_paths", None) or []
