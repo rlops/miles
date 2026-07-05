@@ -9,6 +9,7 @@ from starlette.responses import Response
 from miles.utils.http_utils import post
 from miles.utils.mask_utils import get_response_lengths
 from miles.utils.processing_utils import load_tokenizer
+from miles.utils.rlix_validation import is_rlix_mode
 from miles.utils.types import Sample
 
 from .radix_tree import StringRadixTrie
@@ -64,9 +65,7 @@ class RadixTreeMiddleware(BaseHTTPMiddleware):
         # cache state would survive scheduler shrink/expand. Re-enabling
         # under RLix mode requires a partial_rollout + radix_tree adapter
         # (not in scope for any current milestone).
-        import os as _os  # local import — module top imports must change
-
-        if _os.environ.get("RLIX_CONTROL_PLANE") == "rlix":
+        if is_rlix_mode():
             raise RuntimeError(
                 "RadixTreeMiddleware is forbidden in RLix mode "
                 "(RLIX_CONTROL_PLANE=rlix). partial_rollout + radix_tree "

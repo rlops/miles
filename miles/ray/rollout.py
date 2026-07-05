@@ -41,6 +41,7 @@ from miles.utils.metric_checker import MetricChecker
 from miles.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
 from miles.utils.misc import load_function
 from miles.utils.ray_utils import Box
+from miles.utils.rlix_validation import is_rlix_mode
 from miles.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from miles.utils.tracking_utils import init_tracking
 from miles.utils.types import Sample
@@ -1000,7 +1001,7 @@ class RolloutManager:
             # because release_memory_occupation moves persistent
             # token-pool buffers to CPU mid-iteration. The pause API
             # blocks until the scheduler reaches a safe checkpoint.
-            if os.environ.get("RLIX_CONTROL_PLANE") == "rlix":
+            if is_rlix_mode():
                 # F7 (m11-review.review-report.md §2): documented SGLang
                 # /pause_generation API contract:
                 #   - mode="retract" — waits until the SGLang scheduler reaches
@@ -1755,7 +1756,7 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
             # actually return memory to the OS — which requires
             # enable_memory_saver=True. Force it on under rlix when
             # offload_rollout is set.
-            if args.offload_rollout and os.environ.get("RLIX_CONTROL_PLANE") == "rlix":
+            if args.offload_rollout and is_rlix_mode():
                 needs_offload = True
             overrides = dict(group_cfg.overrides)
             if args.offload_rollout and not needs_offload:
