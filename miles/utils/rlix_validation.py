@@ -208,6 +208,7 @@ def assert_rlix_topology(args: Any, sglang_config: Any | None = None) -> None:
     infer = _infer_devices(args)
     engine_count = _infer_engine_count(args)
     per_engine = int(getattr(args, "rollout_num_gpus_per_engine", 1) or 1)
+    transport = getattr(args, "model_update_transport", "cuda_ipc")
 
     # --- C1: train ⊂ infer (partial overlap)
     if not train.issubset(infer):
@@ -306,7 +307,6 @@ def assert_rlix_topology(args: Any, sglang_config: Any | None = None) -> None:
 
     # --- C11: M11.1 RLix mode forces cpu_serialize transport
     if is_rlix_mode():
-        transport = getattr(args, "model_update_transport", "cuda_ipc")
         if transport != "cpu_serialize":
             raise RuntimeError(
                 f"C11: M11.1 RLix mode forces model_update_transport='cpu_serialize' "
@@ -363,7 +363,6 @@ def assert_rlix_topology(args: Any, sglang_config: Any | None = None) -> None:
     bucket_size_bytes = (
         int(getattr(args, "miles_model_update_bucket_size_mb", 512) or 512) * 1024 * 1024
     )
-    transport = getattr(args, "model_update_transport", "cuda_ipc")
     has_gpu_staging = _topology_has_non_colocate_engines(args) or transport == "cuda_ipc"
     if has_gpu_staging:
         post_wake_free = _estimate_post_wake_free_vram(args)
