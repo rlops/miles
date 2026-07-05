@@ -538,6 +538,12 @@ class MilesRouter:
             return self.enabled_workers - self.dead_workers
         return set(self.worker_request_counts) - self.dead_workers
 
+    def _pick_least_loaded(self, candidates: set[str]) -> str:
+        """Select the least-loaded candidate and increment its in-flight count."""
+        url = min(candidates, key=lambda u: self.worker_request_counts.get(u, 0))
+        self.worker_request_counts[url] += 1
+        return url
+
     def _use_url(self):
         """Synchronous, raise-on-empty selector.
 
@@ -553,9 +559,7 @@ class MilesRouter:
         candidates = self._candidate_set()
         if not candidates:
             raise RuntimeError("No enabled live workers available in the pool")
-        url = min(candidates, key=lambda u: self.worker_request_counts.get(u, 0))
-        self.worker_request_counts[url] += 1
-        return url
+        return self._pick_least_loaded(candidates)
 
     async def _use_url_async(self):
         """C20 0-active suspend selector (production dispatch path).
@@ -574,9 +578,7 @@ class MilesRouter:
         async with self._workers_changed:
             await self._workers_changed.wait_for(lambda: bool(self._candidate_set()))
             candidates = self._candidate_set()
-            url = min(candidates, key=lambda u: self.worker_request_counts.get(u, 0))
-            self.worker_request_counts[url] += 1
-            return url
+            return self._pick_least_loaded(candidates)
 
     async def _notify_workers_changed(self) -> None:
         """Wake every dispatcher suspended in :meth:`_use_url`.

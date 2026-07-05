@@ -142,6 +142,14 @@ class TestLoadBalancing:
         assert selected == "http://w2:8000"
         assert router.worker_request_counts["http://w2:8000"] == 3
 
+    def test_use_url_async_selects_min_load(self, router_factory):
+        router = router_factory()
+        router.worker_request_counts = {"http://w1:8000": 5, "http://w2:8000": 2, "http://w3:8000": 8}
+
+        selected = asyncio.run(router._use_url_async())
+        assert selected == "http://w2:8000"
+        assert router.worker_request_counts["http://w2:8000"] == 3
+
     def test_use_url_excludes_dead_workers(self, router_factory):
         router = router_factory()
         router.worker_request_counts = {"http://w1:8000": 5, "http://w2:8000": 1, "http://w3:8000": 3}
