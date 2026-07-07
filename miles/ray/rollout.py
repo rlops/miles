@@ -975,7 +975,6 @@ class RolloutManager:
         try:
             # Steps 2 + 3: abort + drain.
             self._abort_engines(indices)
-            handles = [self._engines[idx].handle for idx in indices]
             deadline = time.time() + 30.0  # bounded test-side drain; production hardening = M11.5.
             while time.time() < deadline:
                 verdicts = ray.get([h.is_idle.remote() for h in handles])
