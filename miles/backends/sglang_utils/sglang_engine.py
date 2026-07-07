@@ -569,33 +569,48 @@ class SGLangEngine(RayActor):
             return
 
         logger.info(f"Shutdown engine {self.server_host}:{self.server_port}...")
+        # Router removal is best-effort: the router may already be dead in
+        # failure-cleanup scenarios (which is exactly when
+        # RolloutManager.shutdown_hard drives this method). A raise here must
+        # not skip kill_process_tree below — the CUDA context lives in the
+        # SGLang server child processes, and ray.kill on the actor does NOT
+        # terminate them, so skipping the kill orphans their VRAM until a
+        # manual pkill.
         if self.node_rank == 0:
-            worker_url = f"http://{self.server_host}:{self.server_port}"
-            response = None
-            if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_miles_router:
-                response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/remove_worker?url=http://{self.server_host}:{self.server_port}"
-                )
-            elif parse(sglang_router.__version__) < parse("0.3.0"):
-                worker_url = quote(worker_url, safe="")
-                response = requests.delete(f"http://{self.router_ip}:{self.router_port}/workers/{worker_url}")
-            else:
-                try:
-                    all_workers = requests.get(f"http://{self.router_ip}:{self.router_port}/workers").json()["workers"]
-                    for worker in all_workers:
-                        if worker["url"] == worker_url:
-                            worker_id = worker["id"]
-                            response = requests.delete(
-                                f"http://{self.router_ip}:{self.router_port}/workers/{worker_id}"
-                            )
-                            break
-                    else:
-                        logger.warning(f"Worker {worker_url} not found in router during shutdown.")
-                except Exception as e:
-                    logger.warning(f"Failed to fetch workers list or remove worker: {e}")
+            try:
+                worker_url = f"http://{self.server_host}:{self.server_port}"
+                response = None
+                if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_miles_router:
+                    response = requests.post(
+                        f"http://{self.router_ip}:{self.router_port}/remove_worker?url=http://{self.server_host}:{self.server_port}"
+                    )
+                elif parse(sglang_router.__version__) < parse("0.3.0"):
+                    worker_url = quote(worker_url, safe="")
+                    response = requests.delete(f"http://{self.router_ip}:{self.router_port}/workers/{worker_url}")
+                else:
+                    try:
+                        all_workers = requests.get(f"http://{self.router_ip}:{self.router_port}/workers").json()[
+                            "workers"
+                        ]
+                        for worker in all_workers:
+                            if worker["url"] == worker_url:
+                                worker_id = worker["id"]
+                                response = requests.delete(
+                                    f"http://{self.router_ip}:{self.router_port}/workers/{worker_id}"
+                                )
+                                break
+                        else:
+                            logger.warning(f"Worker {worker_url} not found in router during shutdown.")
+                    except Exception as e:
+                        logger.warning(f"Failed to fetch workers list or remove worker: {e}")
 
-            if response is not None:
-                response.raise_for_status()
+                if response is not None:
+                    response.raise_for_status()
+            except Exception as e:
+                logger.warning(
+                    f"shutdown: router worker removal failed (router may already be down); "
+                    f"proceeding to kill the server process tree: {e}"
+                )
         kill_process_tree(self.process.pid)
 
     def get_weight_version(self):
