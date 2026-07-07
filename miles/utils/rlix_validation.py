@@ -31,6 +31,8 @@ import os
 import shutil
 from typing import Any
 
+from miles.utils.environ import enable_experimental_rollout_refactor
+
 logger = logging.getLogger(__name__)
 
 
@@ -312,6 +314,21 @@ def assert_rlix_topology(args: Any, sglang_config: Any | None = None) -> None:
                 f"C11: M11.1 RLix mode forces model_update_transport='cpu_serialize' "
                 f"(got {transport!r}). cuda_ipc colocate adapter is M11.6 follow-up."
             )
+
+    # --- C24: RLix mode requires the legacy rollout call path (extends the
+    # plan's C1-C23 set). The experimental refactor's call_rollout_function
+    # does not thread ``rlix_hooks`` through to the rollout function
+    # (RolloutManager._get_rollout_data only forwards hooks on the legacy
+    # call_rollout_fn path), so every begin_progress_batch / bump_completed
+    # silently no-ops and the F9 progress channel dies. Fail fast until the
+    # refactored path threads the hooks.
+    if is_rlix_mode() and enable_experimental_rollout_refactor():
+        raise RuntimeError(
+            "C24: RLix mode is incompatible with MILES_EXPERIMENTAL_ROLLOUT_REFACTOR=1 — "
+            "the refactored rollout call path does not thread rlix_hooks, which silently "
+            "disables F9 progress reporting. Unset MILES_EXPERIMENTAL_ROLLOUT_REFACTOR "
+            "for RLix runs (or thread rlix_hooks through call_rollout_function first)."
+        )
 
     # --- C7-engine: rollout_num_gpus_per_engine <= num_gpus_per_node (cross-node engine forbidden)
     num_gpus_per_node = int(getattr(args, "num_gpus_per_node", 8) or 8)
