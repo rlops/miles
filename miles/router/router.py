@@ -145,16 +145,7 @@ class MilesRouter:
             try:
                 await asyncio.sleep(interval)
 
-                # Probe only enabled, non-dead workers. Disabled workers are
-                # parked (no traffic should reach them); failing health on
-                # them would fight the F2 disable lifecycle. Health-driven
-                # quarantine still applies once an enabled worker accumulates
-                # enough consecutive failures.
-                #
-                # Legacy / test compat: when admission has never been declared
-                # (``enabled_workers`` is empty), fall back to probing the
-                # full registry the way the pre-iter-6 router did.
-                if self.enabled_workers:
+                if self._admission_declared:
                     urls = [u for u in self.enabled_workers if u not in self.dead_workers]
                 else:
                     urls = [u for u in self.worker_request_counts if u not in self.dead_workers]

@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import os
 import sys
+import asyncio
+import types
 import unittest
 from unittest import mock
 
@@ -59,7 +61,24 @@ class TestRouterAdmissionLifecycle(unittest.TestCase):
     """
 
     def _build_router(self):
-        from miles.router.router import MilesRouter
+        ray_stub = types.ModuleType("ray")
+        ray_stub.remote = lambda *args, **kwargs: (
+            args[0] if args and callable(args[0]) and not kwargs else lambda obj: obj
+        )
+        ray_util_stub = types.ModuleType("ray.util")
+        scheduling_stub = types.ModuleType("ray.util.scheduling_strategies")
+        scheduling_stub.NodeAffinitySchedulingStrategy = object
+
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "ray": ray_stub,
+                "ray.util": ray_util_stub,
+                "ray.util.scheduling_strategies": scheduling_stub,
+            },
+        ):
+            from miles.router.router import MilesRouter
+            self.router_module = sys.modules[MilesRouter.__module__]
 
         args = mock.Mock()
         args.miles_router_max_connections = 8
@@ -95,6 +114,26 @@ class TestRouterAdmissionLifecycle(unittest.TestCase):
         self.assertNotIn("http://w1:8000", router.worker_request_counts)
         self.assertNotIn("http://w1:8000", router.enabled_workers)
         self.assertNotIn("http://w1:8000", router.worker_engine_index_map)
+
+    def test_health_check_does_not_probe_disabled_workers_when_zero_active(self):
+        router = self._build_router()
+        router._add_worker_internal("http://w1:8000", engine_index=0)
+        router._disable_worker_internal("http://w1:8000")
+        router._check_worker_health = mock.AsyncMock()
+
+        sleep_calls = 0
+
+        async def sleep_once_then_cancel(_interval):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls > 1:
+                raise asyncio.CancelledError
+
+        with mock.patch.object(self.router_module.asyncio, "sleep", sleep_once_then_cancel):
+            with self.assertRaises(asyncio.CancelledError):
+                asyncio.run(router._health_check_loop())
+
+        router._check_worker_health.assert_not_called()
 
 
 class TestSchedulerPreemptClassification(unittest.TestCase):
