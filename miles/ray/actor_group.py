@@ -147,7 +147,7 @@ class RayTrainGroup:
             cvd = ",".join(str(g) for g in wp.gpu_ids)
             env_vars = dict(env_vars_base)
             env_vars["CUDA_VISIBLE_DEVICES"] = cvd
-            TrainRayActor = ray.remote(num_gpus=1, runtime_env={"env_vars": env_vars})(actor_impl)
+            TrainRayActor = ray.remote(runtime_env={"env_vars": env_vars})(actor_impl)
             actor = TrainRayActor.options(
                 num_cpus=num_gpus_per_actor,
                 num_gpus=num_gpus_per_actor,
