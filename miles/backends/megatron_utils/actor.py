@@ -850,6 +850,23 @@ class MegatronTrainRayActor(TrainRayActor):
 
         cache = self._ensure_cpu_bucket_cache()
         with self._cache_lock:
+            # Single-ready-slot supersession guard: a newer step may have
+            # been built (discarding the requested one) while this sync RPC
+            # was in flight — e.g. an expand-sync dispatched with a
+            # snapshot version racing the next after_training publish
+            # (observed: expand sync v=0 vs ready_step=1 → KeyError →
+            # scheduler-loop death). Syncing the LATEST step is correct
+            # for every caller (engines must end on current weights); the
+            # actual version is returned so the service publishes truth.
+            # ready < requested stays a hard error (real ordering bug).
+            ready = cache.cache_ready_step
+            if ready is not None and int(ready) > int(version):
+                logger.warning(
+                    "run_sync_session sync_id=%s: requested step=%s superseded by "
+                    "ready_step=%s while in flight — syncing %s instead",
+                    sync_id, version, ready, ready,
+                )
+                version = int(ready)
             buckets = cache.get_step(version)
             if not buckets:
                 logger.info(
