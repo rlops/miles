@@ -616,13 +616,42 @@ class SGLangEngine(RayActor):
             {"lora_name": lora_name},
         )
 
+    def _log_whole_gpu(self, label: str) -> None:
+        """SGL offload audit: whole-GPU used (nvidia-smi) for this engine's
+        visible GPUs — before/after release/resume shows how much physical
+        memory the engine actually returned, independent of PID-namespace
+        issues that break per-process attribution on some containers."""
+        import subprocess
+
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"],
+                text=True, timeout=10,
+            )
+            rows = dict(line.split(", ") for line in out.strip().splitlines())
+            cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            visible = [x.strip() for x in cvd.split(",") if x.strip()] or sorted(rows)
+            usage = {g: f"{rows.get(g)} MiB" for g in visible}
+            # print (not logger): the engine actor process has no logging
+            # handler configured, so logger.info is silently dropped; Ray
+            # forwards actor stdout unconditionally.
+            print(
+                f"[SGL-OFFLOAD-AUDIT] {label} engine={self.server_host}:{self.server_port} gpus={usage}",
+                flush=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[SGL-OFFLOAD-AUDIT] {label}: probe failed {exc!r}", flush=True)
+
     def release_memory_occupation(self, tags: list[str] = None):
         """Release memory occupation. Available tags: weights, kv_cache."""
+        self._log_whole_gpu("before release_memory_occupation")
         self.flush_cache()
-        return self._make_request(
+        result = self._make_request(
             "release_memory_occupation",
             {"tags": tags},
         )
+        self._log_whole_gpu("after release_memory_occupation")
+        return result
 
     # ------------------------------------------------------------------
     # F1 RLix-mode sleep/wake helpers (used by F2 RolloutManager.shrink_engines)
@@ -825,10 +854,13 @@ class SGLangEngine(RayActor):
         """
         Available tags for multi-stage resume: weights, kv_cache
         """
-        return self._make_request(
+        self._log_whole_gpu("before resume_memory_occupation")
+        result = self._make_request(
             "resume_memory_occupation",
             {"tags": tags},
         )
+        self._log_whole_gpu("after resume_memory_occupation")
+        return result
 
     def check_weights(self, action: str):
         return self._make_request("weights_checker", {"action": action})

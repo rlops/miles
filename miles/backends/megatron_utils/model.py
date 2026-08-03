@@ -449,6 +449,9 @@ def train_one_step(
         return output_tensor, partial(loss_function, args, batch, num_microbatches, apply_megatron_loss_scaling=True)
 
     # Forward pass.
+    from miles.utils.memory_utils import log_nontorch as _log_nontorch
+
+    _log_nontorch("before forward_backward")
     forward_backward_func = get_forward_backward_func()
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step,
@@ -461,6 +464,7 @@ def train_one_step(
         forward_only=False,
     )
 
+    _log_nontorch("after forward_backward")
     valid_step = True
     grad_norm = 0.0
     if (not disable_optimizer) and (not getattr(args, "check_for_nan_in_loss_and_grad", True)):
@@ -489,6 +493,7 @@ def train_one_step(
         # Update learning rate.
         assert update_successful
         opt_param_scheduler.step(increment=args.global_batch_size)
+        _log_nontorch("after optimizer.step")
 
     # release grad
     for model_chunk in model:

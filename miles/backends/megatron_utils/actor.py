@@ -254,7 +254,11 @@ class MegatronTrainRayActor(TrainRayActor):
 
         clear_memory()
         if not skip_tms:
+            from miles.utils.memory_utils import log_nontorch
+
+            log_nontorch("before reload_process_groups")
             reload_process_groups()
+            log_nontorch("after reload_process_groups")
         print_memory("after wake_up model")
 
     def _switch_model(self, target_tag: str) -> None:
@@ -679,6 +683,9 @@ class MegatronTrainRayActor(TrainRayActor):
         from .update_weight.cpu_bucket_cache import BucketEntry
         from .update_weight.hf_weight_iterator_base import HfWeightIteratorBase
 
+        from miles.utils.memory_utils import log_nontorch
+
+        log_nontorch(f"before build_cpu_bucket_cache step={step}")
         cache = self._ensure_cpu_bucket_cache()
         is_owner = self._is_cache_owner_rank()
 
@@ -760,6 +767,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 )
 
             cache.put_step(int(step), buckets)
+        log_nontorch(f"after build_cpu_bucket_cache step={step}")
         return int(step)
 
     def run_sync_session(self, plan) -> int:

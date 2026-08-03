@@ -637,7 +637,7 @@ index 293a84350..68911c433 100644
 @@ -137,6 +148,13 @@ class SchedulerUpdateWeightsMixin:
              self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
              self.flush_cache()
- 
+
 +            if self.disaggregation_mode == DisaggregationMode.DECODE:
 +                if hasattr(self, "disagg_decode_prealloc_queue"):
 +                    self.disagg_decode_prealloc_queue.release_memory_occupation()
