@@ -74,14 +74,14 @@ class TestRouterAdmissionLifecycle(unittest.TestCase):
 
     def test_add_worker_admits_by_default(self):
         router = self._build_router()
-        router._add_worker_internal("http://w1:8000", engine_index=0)
+        router._add_worker_internal("http://w1:8000")
         self.assertIn("http://w1:8000", router.enabled_workers)
         self.assertEqual(router.worker_request_counts["http://w1:8000"], 0)
         self.assertTrue(router._admission_declared)
 
     def test_disable_worker_keeps_request_counts(self):
         router = self._build_router()
-        router._add_worker_internal("http://w1:8000", engine_index=0)
+        router._add_worker_internal("http://w1:8000")
         router._disable_worker_internal("http://w1:8000")
         self.assertNotIn("http://w1:8000", router.enabled_workers)
         # Preserved so in-flight balance accounting stays consistent.
@@ -90,11 +90,10 @@ class TestRouterAdmissionLifecycle(unittest.TestCase):
 
     def test_remove_worker_drops_all_state(self):
         router = self._build_router()
-        router._add_worker_internal("http://w1:8000", engine_index=0)
+        router._add_worker_internal("http://w1:8000")
         router._remove_worker_internal("http://w1:8000")
         self.assertNotIn("http://w1:8000", router.worker_request_counts)
         self.assertNotIn("http://w1:8000", router.enabled_workers)
-        self.assertNotIn("http://w1:8000", router.worker_engine_index_map)
 
 
 class TestSchedulerPreemptClassification(unittest.TestCase):

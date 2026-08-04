@@ -117,7 +117,7 @@ class EnginePreemptedError(Exception):
 class RLixRouterMetadataError(Exception):
     """Raised when an RLix-mode generate response is missing router-injected metadata.
 
-    The MILES router injects ``meta_info["miles_engine_index", "miles_admission_disabled"]``
+    The MILES router injects ``meta_info["miles_admission_disabled"]``
     into every ``/generate`` JSON response in RLix mode. Absence is treated as a fatal
     misconfiguration rather than allowing turn-level redispatch to silently degrade.
     """
