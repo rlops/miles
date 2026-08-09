@@ -613,18 +613,17 @@ class MegatronTrainRayActor(TrainRayActor):
         rebuild. Bucket size cap comes from
         ``args.miles_model_update_bucket_size_mb`` (cf. F10 S2/S3a-2
         startup checks).
+
+        No actor-level lock guards ``build_cpu_bucket_cache`` /
+        ``run_sync_session``: train actors must stay default sync Ray actors
+        (no ``max_concurrency``), so Ray serializes their calls. The cache's
+        own lock protects its internal state.
         """
         if not hasattr(self, "_cpu_bucket_cache") or self._cpu_bucket_cache is None:
             from .update_weight.cpu_bucket_cache import CPUBucketCache
 
             max_bytes = int(getattr(self.args, "miles_model_update_bucket_size_mb", 512)) * 1024 * 1024
             self._cpu_bucket_cache = CPUBucketCache(max_bucket_size_bytes=max_bytes)
-            # F20: bucket build / sync session each acquire this lock for
-            # the whole critical section (single-method-single-critical-
-            # section). Cross-RPC locking is forbidden (Layer 1 / F04).
-            import threading as _threading
-
-            self._cache_lock = _threading.Lock()
         return self._cpu_bucket_cache
 
     @staticmethod
@@ -701,65 +700,56 @@ class MegatronTrainRayActor(TrainRayActor):
         # weights.
         megatron_local_weights = self.weights_backuper.get("actor")
 
-        with self._cache_lock:
-            if not is_owner:
-                # Non-owner ranks must still drive the collective gather
-                # (each chunk is implicitly cross-rank inside
-                # _get_megatron_full_params + all_gather_params_async),
-                # but they discard the resulting tensors and advance
-                # their pointer in lockstep.
-                for _ in iterator.get_hf_weight_chunks(megatron_local_weights):
-                    pass
-                cache.put_empty_step(int(step))
-                return int(step)
+        if not is_owner:
+            # Non-owner ranks must still drive the collective gather, but
+            # discard the resulting tensors and advance their pointer.
+            for _ in iterator.get_hf_weight_chunks(megatron_local_weights):
+                pass
+            cache.put_empty_step(int(step))
+            return int(step)
 
-            # F4 bucket layout (cache_owner only): pack (name, tensor)
-            # pairs into buckets up to max_bucket_size_bytes each. The
-            # iterator yields chunks of (name, hf_tensor); tensors come
-            # back on the GPU device (cuda.current_device()) for the
-            # standalone broadcast path, so we materialize to CPU here
-            # before storing — BucketEntry rejects CUDA tensors per the
-            # cpu_serialize transport contract.
-            max_bytes = cache.max_bucket_size_bytes
-            buckets: list[BucketEntry] = []
-            current: dict[str, torch.Tensor] = {}
-            current_bytes = 0
-            current_elements = 0
-            current_idx = 0
-            for chunk in iterator.get_hf_weight_chunks(megatron_local_weights):
-                for name, tensor in chunk:
-                    if not isinstance(tensor, torch.Tensor):
-                        continue
-                    if tensor.is_cuda:
-                        tensor = tensor.detach().to("cpu")
-                    tensor_bytes = tensor.element_size() * tensor.numel()
-                    if current_bytes + tensor_bytes > max_bytes and current:
-                        buckets.append(
-                            BucketEntry(
-                                bucket_index=current_idx,
-                                params=current,
-                                size_bytes=current_bytes,
-                                element_count=current_elements,
-                            )
+        # F4 bucket layout (cache_owner only): pack (name, tensor) pairs
+        # into CPU buckets up to max_bucket_size_bytes each.
+        max_bytes = cache.max_bucket_size_bytes
+        buckets: list[BucketEntry] = []
+        current: dict[str, torch.Tensor] = {}
+        current_bytes = 0
+        current_elements = 0
+        current_idx = 0
+        for chunk in iterator.get_hf_weight_chunks(megatron_local_weights):
+            for name, tensor in chunk:
+                if not isinstance(tensor, torch.Tensor):
+                    continue
+                if tensor.is_cuda:
+                    tensor = tensor.detach().to("cpu")
+                tensor_bytes = tensor.element_size() * tensor.numel()
+                if current_bytes + tensor_bytes > max_bytes and current:
+                    buckets.append(
+                        BucketEntry(
+                            bucket_index=current_idx,
+                            params=current,
+                            size_bytes=current_bytes,
+                            element_count=current_elements,
                         )
-                        current_idx += 1
-                        current = {}
-                        current_bytes = 0
-                        current_elements = 0
-                    current[name] = tensor
-                    current_bytes += tensor_bytes
-                    current_elements += tensor.numel()
-            if current:
-                buckets.append(
-                    BucketEntry(
-                        bucket_index=current_idx,
-                        params=current,
-                        size_bytes=current_bytes,
-                        element_count=current_elements,
                     )
+                    current_idx += 1
+                    current = {}
+                    current_bytes = 0
+                    current_elements = 0
+                current[name] = tensor
+                current_bytes += tensor_bytes
+                current_elements += tensor.numel()
+        if current:
+            buckets.append(
+                BucketEntry(
+                    bucket_index=current_idx,
+                    params=current,
+                    size_bytes=current_bytes,
+                    element_count=current_elements,
                 )
+            )
 
-            cache.put_step(int(step), buckets)
+        cache.put_step(int(step), buckets)
         return int(step)
 
     def run_sync_session(self, plan) -> int:
@@ -768,10 +758,7 @@ class MegatronTrainRayActor(TrainRayActor):
         Per scope F04 (Layer 1 forbidden) the cache_owner exposes ONE
         top-level Ray method for transporting a sync session; helpers
         (per-engine cpu_serialize, NCCL group setup/broadcast/destroy)
-        are in-method private helpers, NOT separate Ray RPCs. The
-        ``_cache_lock`` is held for the whole transport phase so the
-        bucket list snapshot + payload generation cannot be torn by a
-        concurrent build_cpu_bucket_cache.
+        are in-method private helpers, NOT separate Ray RPCs.
 
         ``plan`` is a plain mapping (per cozy-plan §Shared protocol
         contract — RLix may use a frozen dataclass internally but
@@ -849,73 +836,64 @@ class MegatronTrainRayActor(TrainRayActor):
         world_size: int = int(plan["world_size"])
 
         cache = self._ensure_cpu_bucket_cache()
-        with self._cache_lock:
-            # Single-ready-slot supersession guard: a newer step may have
-            # been built (discarding the requested one) while this sync RPC
-            # was in flight — e.g. an expand-sync dispatched with a
-            # snapshot version racing the next after_training publish
-            # (observed: expand sync v=0 vs ready_step=1 → KeyError →
-            # scheduler-loop death). Syncing the LATEST step is correct
-            # for every caller (engines must end on current weights); the
-            # actual version is returned so the service publishes truth.
-            # ready < requested stays a hard error (real ordering bug).
-            ready = cache.cache_ready_step
-            if ready is not None and int(ready) > int(version):
-                logger.warning(
-                    "run_sync_session sync_id=%s: requested step=%s superseded by "
-                    "ready_step=%s while in flight — syncing %s instead",
-                    sync_id, version, ready, ready,
-                )
-                version = int(ready)
-            buckets = cache.get_step(version)
-            if not buckets:
-                logger.info(
-                    "run_sync_session sync_id=%s version=%s found 0 buckets — empty publish",
-                    sync_id,
-                    version,
-                )
-                return version
+        # Single-ready-slot supersession guard: a newer step may have
+        # been built (discarding the requested one) while this sync RPC
+        # was in flight — e.g. an expand-sync dispatched with a
+        # snapshot version racing the next after_training publish
+        # (observed: expand sync v=0 vs ready_step=1 → KeyError →
+        # scheduler-loop death). Syncing the LATEST step is correct
+        # for every caller (engines must end on current weights); the
+        # actual version is returned so the service publishes truth.
+        # ready < requested stays a hard error (real ordering bug).
+        ready = cache.cache_ready_step
+        if ready is not None and int(ready) > int(version):
+            logger.warning(
+                "run_sync_session sync_id=%s: requested step=%s superseded by "
+                "ready_step=%s while in flight — syncing %s instead",
+                sync_id, version, ready, ready,
+            )
+            version = int(ready)
+        buckets = cache.get_step(version)
+        if not buckets:
+            logger.info(
+                "run_sync_session sync_id=%s version=%s found 0 buckets — empty publish",
+                sync_id,
+                version,
+            )
+            return version
 
-            # Path A: cpu_serialize per-engine RPC (tmpfs payload). The
-            # wrapper owns the tmpfs file lifecycle (try/finally
-            # os.unlink) per scope F28; payload is materialized once
-            # per (bucket, engine) pair so peak /dev/shm = 1× bucket
-            # size (serial per-bucket receiver invocation).
-            for bucket in buckets:
-                if not cpu_serialize_local_ranks:
-                    break
-                self._dispatch_cpu_serialize_bucket(
-                    sync_id=sync_id,
-                    bucket=bucket,
-                    target_handles={
-                        idx: target_handles[idx]
-                        for idx in cpu_serialize_local_ranks
-                        if idx in target_handles
-                    },
-                )
+        # Path A: cpu_serialize per-engine RPC (tmpfs payload). The
+        # wrapper owns the tmpfs file lifecycle (try/finally os.unlink).
+        for bucket in buckets:
+            if not cpu_serialize_local_ranks:
+                break
+            self._dispatch_cpu_serialize_bucket(
+                sync_id=sync_id,
+                bucket=bucket,
+                target_handles={
+                    idx: target_handles[idx]
+                    for idx in cpu_serialize_local_ranks
+                    if idx in target_handles
+                },
+            )
 
-            # Path B: NCCL broadcast non-colocate path. Set up a dynamic
-            # group with TCP rendezvous, broadcast each bucket from
-            # cache_owner (rank 0), and tear the group down after the
-            # last bucket. F25: warmup allreduce on every CREATE; F26
-            # already enforced master_port != 0 above; F03/Anti-regression
-            # invariant #3: is_group_exist no-op guard on destroy is
-            # provided by SGLangEngine.destroy_collective_group.
-            if broadcast_local_ranks:
-                self._dispatch_nccl_broadcast(
-                    sync_id=sync_id,
-                    buckets=buckets,
-                    target_handles={
-                        idx: target_handles[idx]
-                        for idx in broadcast_local_ranks
-                        if idx in target_handles
-                    },
-                    group_name=group_name,
-                    master_addr=master_addr,
-                    master_port=master_port,
-                    comm_ranks=comm_ranks,
-                    world_size=world_size,
-                )
+        # Path B: NCCL broadcast non-colocate path. The sender path is
+        # currently guarded in _dispatch_nccl_broadcast.
+        if broadcast_local_ranks:
+            self._dispatch_nccl_broadcast(
+                sync_id=sync_id,
+                buckets=buckets,
+                target_handles={
+                    idx: target_handles[idx]
+                    for idx in broadcast_local_ranks
+                    if idx in target_handles
+                },
+                group_name=group_name,
+                master_addr=master_addr,
+                master_port=master_port,
+                comm_ranks=comm_ranks,
+                world_size=world_size,
+            )
 
         return version
 
