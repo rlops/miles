@@ -184,6 +184,11 @@ def main():
         "TMS_INIT_ENABLE_CPU_BACKUP",
         "CUDA_DEVICE_MAX_CONNECTIONS",
         "NCCL_NVLS_ENABLE",
+        # Resize-chain timeout knobs read inside the MilesCoordinator
+        # actor process (rlops/rlix#35); without explicit forwarding a
+        # driver-side export never reaches the actor on multi-node.
+        "RLIX_RESIZE_LOCK_TIMEOUT_S",
+        "MILES_RESIZE_RPC_TIMEOUT_S",
     ):
         if (_v := os.environ.get(_k)) is not None:
             pipeline_runtime_env_vars[_k] = _v
