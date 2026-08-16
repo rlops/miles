@@ -906,6 +906,33 @@ class RolloutManager:
         # so callers document intent.
         self._release_abort_idempotency_for(engine_indices)
 
+    def register_router_if_active(self, engine_indices: Iterable[int]) -> list[int]:
+        """rlix#42 sync-under-load bracket: atomically re-open router
+        admission for engines that are STILL ``active`` at this exact
+        moment, skipping every other state.
+
+        Runs on the manager's single-threaded execution (plain
+        ``@ray.remote`` — max_concurrency 1), so it is serialized against
+        ``shrink_engines``: the TOCTOU between a coordinator-side state
+        read and a separate per-engine ``/add_worker`` cannot be
+        interleaved by a shrink that starts in between (codex impl-r13).
+        ``register_with_router`` is idempotent at the router and raises
+        on non-2xx. Returns the indices actually re-registered.
+
+        Deliberately does NOT use ``_resolve_engine_indices``: that
+        helper raises for non-alive engines, but skipping a
+        concurrently-shrunk (offloaded/disabling) engine is exactly this
+        method's contract — silent skip, reported via the return value.
+        """
+        registered: list[int] = []
+        for idx in sorted(set(int(i) for i in engine_indices)):
+            info = self._engines.get(idx)
+            if info is None or info.state != "active":
+                continue
+            ray.get(info.handle.register_with_router.remote())
+            registered.append(idx)
+        return registered
+
     def get_router_enabled_workers(self) -> list[str]:
         """M11.2 Option β 3e: snapshot the router's ``enabled_workers`` set.
 

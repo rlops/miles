@@ -898,6 +898,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     master_port=master_port,
                     comm_ranks=comm_ranks,
                     world_size=world_size,
+                    timeout_s=float(plan["timeout_s"]),
                 )
 
         return version
@@ -949,80 +950,28 @@ class MegatronTrainRayActor(TrainRayActor):
         master_port: int,
         comm_ranks: dict[int, int],
         world_size: int,
+        timeout_s: float = 0.0,
     ) -> None:
         """In-method helper: dynamic NCCL broadcast of bucket payloads.
 
-        **MILES-side self-guard (cross-cutting review P1-8)**: the sender-
-        side ``init_process_group`` + per-bucket ``dist.broadcast`` +
-        ``dist.destroy_process_group`` is NOT yet wired here. The
-        receiver-side fan-out below (``setup_collective_group`` +
-        ``broadcast_parameter`` + ``destroy_collective_group``) would
-        block forever on ``init_weights_update_group`` waiting for an
-        absent rank-0 sender. Until the sender path lands, refuse to
-        even attempt the receiver-side setup so MILES does not depend
-        on the RLix-side service guard for safety. The MILES contract
-        is "zero RLix import dependency"; MILES must self-guard.
+        Sender-side NCCL (rlops/rlix#42): the cache_owner joins the dynamic
+        group as rank 0 and broadcasts each bucket tensor to the SGLang
+        receiver engines. Delegates to the module-level
+        :func:`_run_sender_broadcast` so the transport logic is
+        unit-testable without constructing a full Megatron actor; the
+        function is a private helper, NOT a Ray RPC (scope F04).
         """
-        if not target_handles:
-            return
-        raise NotImplementedError(
-            "broadcast transport requires sender-side NCCL "
-            "(init_process_group + dist.broadcast on the cache_owner). "
-            "Until the sender-side path lands, plans must route every "
-            "target through cpu_serialize. MilesModelUpdateService "
-            "already raises in iter 19/20; this MILES-side guard makes "
-            "the same invariant explicit at the receiver fan-out."
+        _run_sender_broadcast(
+            sync_id=sync_id,
+            buckets=buckets,
+            target_handles=target_handles,
+            group_name=group_name,
+            master_addr=master_addr,
+            master_port=master_port,
+            comm_ranks=comm_ranks,
+            world_size=world_size,
+            timeout_s=timeout_s,
         )
-        if world_size <= 0:
-            raise ValueError(
-                f"_dispatch_nccl_broadcast requires world_size > 0; got {world_size}"
-            )
-        # Receiver-side group create with the same world_size value the
-        # sender uses (cache_owner == rank 0, plus one entry per
-        # receiver engine that participates in the broadcast).
-        ray.get(
-            [
-                handle.setup_collective_group.remote(
-                    group_name=group_name,
-                    master_addr=master_addr,
-                    master_port=master_port,
-                    rank=comm_ranks[engine_index],
-                    world_size=int(world_size),
-                )
-                for engine_index, handle in target_handles.items()
-            ]
-        )
-        try:
-            for bucket in buckets:
-                # Per-bucket metadata for SGLang's
-                # update_weights_from_distributed admin route.
-                names: list[str] = []
-                dtypes: list[str] = []
-                shapes: list[list[int]] = []
-                for name, tensor in bucket.params.items():
-                    names.append(name)
-                    dtypes.append(str(tensor.dtype).replace("torch.", ""))
-                    shapes.append(list(tensor.shape))
-                ray.get(
-                    [
-                        handle.broadcast_parameter.remote(
-                            sync_id=sync_id,
-                            bucket_index=int(bucket.bucket_index),
-                            group_name=group_name,
-                            names=names,
-                            dtypes=dtypes,
-                            shapes=shapes,
-                        )
-                        for handle in target_handles.values()
-                    ]
-                )
-        finally:
-            ray.get(
-                [
-                    handle.destroy_collective_group.remote(group_name=group_name)
-                    for handle in target_handles.values()
-                ]
-            )
 
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:
         old_args = self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune
@@ -1072,3 +1021,325 @@ class MegatronTrainRayActor(TrainRayActor):
             rank=0 if self.role == "actor" else 1,
             group_name=group_name,
         )
+
+
+# ----------------------------------------------------------------------
+# F4 Path B sender-side NCCL broadcast helpers (rlops/rlix#42).
+#
+# Module-level so the transport logic is unit-testable without a full
+# MegatronTrainRayActor (megatron init). These are private helpers of
+# run_sync_session's dispatch, NOT Ray RPCs (scope F04). The nested
+# receiver refs issued here are OWNED here: the finally block cancels
+# them and destroys the group on both sides on every exit path — the
+# RLix service's inflight_refs never covers them (plan C6 enforcement
+# split).
+# ----------------------------------------------------------------------
+
+_BROADCAST_STAGING_MARGIN_ENV = "MILES_BROADCAST_STAGING_MARGIN_GB"
+# Fallback budgets when the plan carries no positive timeout_s (the RLix
+# service's asyncio.wait_for is disabled): rendezvous / transport /
+# teardown, in seconds.
+_BROADCAST_FALLBACK_BUDGETS_S = (30.0, 90.0, 15.0)
+
+
+def _broadcast_budgets(timeout_s: float) -> tuple[float, float, float]:
+    """C6 deadline hierarchy: (rendezvous, transport, teardown_grace).
+
+    Fractions of the session deadline chosen so the sender's worst case
+    completes strictly inside the RLix service's
+    ``asyncio.wait_for(timeout_s)`` — the service deadline then only
+    fires for a truly wedged sender (fail-fast path), never as a normal
+    cleanup path.
+
+    Enforcement layers for the native NCCL work (codex impl-r1 high):
+    the rendezvous budget doubles as the process-group timeout, so the
+    NCCL watchdog bounds EACH individual collective; a cumulative
+    monotonic deadline (rendezvous + transport) is checked between
+    tensors/buckets in :func:`_run_sender_broadcast`. Worst-case unwind
+    is therefore rendezvous + transport + one in-flight collective +
+    teardown = (0.15 + 0.5 + 0.15 + 0.1) x timeout_s = 0.9 x timeout_s
+    < the session deadline, with 0.1 x margin.
+    """
+    if timeout_s and timeout_s > 0:
+        return 0.15 * timeout_s, 0.5 * timeout_s, 0.1 * timeout_s
+    return _BROADCAST_FALLBACK_BUDGETS_S
+
+
+def _ensure_nccl_async_error_handling() -> None:
+    """The per-collective hard bound (C6) is enforced by the NCCL
+    watchdog, which async error handling enables. An explicitly DISABLED
+    setting would silently reintroduce unbounded native collectives
+    (codex impl-r2 high), so fail fast on it instead of overwriting the
+    operator's choice; when unset, pin the torch default explicitly.
+    Checks the legacy ``NCCL_ASYNC_ERROR_HANDLING`` alias too (older
+    torch reads it as a fallback)."""
+    import os as _os
+
+    for var in ("TORCH_NCCL_ASYNC_ERROR_HANDLING", "NCCL_ASYNC_ERROR_HANDLING"):
+        raw = _os.environ.get(var)
+        if raw is not None and raw.strip() == "0":
+            raise RuntimeError(
+                f"{var}=0 disables the NCCL watchdog, which the broadcast "
+                "transport's per-collective hard bound (plan C6) depends on; "
+                "a blocked dist.broadcast would then hang the cache_owner "
+                "past the session deadline. Unset it or set it to a non-zero "
+                "handling mode before enabling broadcast transport."
+            )
+    _os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+
+
+def _monotonic() -> float:
+    """Seam for unit tests to drive the transport deadline clock."""
+    import time as _time
+
+    return _time.monotonic()
+
+
+def _check_transport_deadline(deadline: float, sync_id: str, bucket_index: int) -> None:
+    """Cumulative sender-side transport deadline check, run between
+    collectives (a blocked in-flight collective is bounded separately by
+    the process-group timeout / NCCL watchdog)."""
+    if _monotonic() > deadline:
+        raise TimeoutError(
+            f"_run_sender_broadcast sync_id={sync_id} bucket={bucket_index}: "
+            "cumulative transport deadline exceeded; aborting before the next "
+            "collective (C6 sender-side bound)"
+        )
+
+
+def _staging_margin_bytes() -> int:
+    """Free-VRAM safety margin required on top of a bucket before
+    whole-bucket staging (default 1 GiB, env-overridable)."""
+    import os as _os
+
+    raw = _os.environ.get(_BROADCAST_STAGING_MARGIN_ENV, "")
+    if not raw:
+        return 1024**3
+    try:
+        margin_gb = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{_BROADCAST_STAGING_MARGIN_ENV} must be a float, got {raw!r}"
+        ) from exc
+    if margin_gb < 0:
+        raise ValueError(
+            f"{_BROADCAST_STAGING_MARGIN_ENV} must be >= 0, got {margin_gb}"
+        )
+    return int(margin_gb * 1024**3)
+
+
+def _plan_bucket_staging(bucket_size_bytes: int, free_bytes: int, margin_bytes: int) -> str:
+    """Memory preflight decision: ``"bucket"`` = stage the whole bucket on
+    GPU at once (batching optimization); ``"tensor"`` = degrade to
+    tensor-by-tensor staging. Degradation changes batching only — the
+    broadcast sequence and metadata order are identical either way.
+    """
+    if free_bytes >= bucket_size_bytes + margin_bytes:
+        return "bucket"
+    return "tensor"
+
+
+def _resolve_staging_device():
+    """The cache_owner's CUDA device used to stage CPU bucket tensors for
+    NCCL. Separated out so unit tests can patch it to a CPU device."""
+    return torch.device("cuda", torch.cuda.current_device())
+
+
+def _query_free_bytes(device) -> int:
+    """Free bytes on ``device`` per the CUDA allocator. Separated out for
+    unit-test patching."""
+    free_bytes, _total = torch.cuda.mem_get_info(device)
+    return int(free_bytes)
+
+
+def _run_sender_broadcast(
+    *,
+    sync_id: str,
+    buckets,
+    target_handles: dict[int, Any],
+    group_name: str,
+    master_addr: str,
+    master_port: int,
+    comm_ranks: dict[int, int],
+    world_size: int,
+    timeout_s: float,
+) -> None:
+    """Sender-side dynamic NCCL broadcast (F4 Path B).
+
+    Deadlock-safe ordering (mirrors the proven standalone
+    ``UpdateWeightFromDistributed`` pattern; plan R1/A6):
+
+      1. dispatch receiver ``setup_collective_group`` refs async —
+         no ``ray.get`` yet (receivers block in
+         ``/init_weights_update_group`` until rank 0 joins);
+      2. sender joins as rank 0 with a bounded rendezvous timeout, so a
+         receiver that dies / rejects / hangs mid-rendezvous cannot
+         wedge rank 0 (E7);
+      3. ``ray.get`` the setup refs — a receiver-side setup failure
+         surfaces here and takes the abort path;
+      4. per bucket: dispatch ``broadcast_parameter`` metadata refs
+         async, memory-preflight the staging (E8), ``dist.broadcast``
+         each tensor in metadata order, then ``ray.get`` the refs;
+      5. ``finally``: sender-owned teardown on success, exception, and
+         budget expiry alike — cancel outstanding nested refs, receiver
+         ``destroy_collective_group`` fan-out (400-tolerant on the
+         engine side), sender ``destroy_process_group``.
+    """
+    if not target_handles:
+        return
+    if world_size <= 0:
+        raise ValueError(
+            f"_run_sender_broadcast requires world_size > 0; got {world_size}"
+        )
+    missing = sorted(i for i in target_handles if i not in comm_ranks)
+    if missing:
+        raise KeyError(
+            f"_run_sender_broadcast: comm_ranks missing engine indices {missing}"
+        )
+
+    import datetime as _datetime
+
+    rendezvous_budget_s, transport_budget_s, teardown_grace_s = _broadcast_budgets(
+        float(timeout_s)
+    )
+    # The process-group timeout below is the per-collective hard bound;
+    # it is enforced by the NCCL watchdog. Fail fast if async error
+    # handling has been explicitly disabled (must run before the group
+    # is constructed).
+    _ensure_nccl_async_error_handling()
+    transport_deadline = _monotonic() + rendezvous_budget_s + transport_budget_s
+    nested_refs: list = []
+    sender_group = None
+    try:
+        setup_refs = [
+            handle.setup_collective_group.remote(
+                group_name=group_name,
+                master_addr=master_addr,
+                master_port=int(master_port),
+                rank=int(comm_ranks[engine_index]),
+                world_size=int(world_size),
+            )
+            for engine_index, handle in sorted(target_handles.items())
+        ]
+        nested_refs.extend(setup_refs)
+        # Sender join BEFORE getting the setup refs: init_process_group
+        # blocks until all ranks join and the receiver HTTP routes block
+        # until rank 0 shows up — a ray.get here first would deadlock.
+        # The timeout doubles as the group's per-collective bound (see
+        # _broadcast_budgets).
+        sender_group = init_process_group(
+            backend="nccl",
+            init_method=f"tcp://{master_addr}:{int(master_port)}",
+            world_size=int(world_size),
+            rank=0,
+            group_name=group_name,
+            timeout=_datetime.timedelta(seconds=rendezvous_budget_s),
+        )
+        ray.get(setup_refs, timeout=rendezvous_budget_s)
+
+        device = _resolve_staging_device()
+        margin_bytes = _staging_margin_bytes()
+        for bucket in buckets:
+            names: list[str] = []
+            dtypes: list[str] = []
+            shapes: list[list[int]] = []
+            for name, tensor in bucket.params.items():
+                names.append(name)
+                dtypes.append(str(tensor.dtype).replace("torch.", ""))
+                shapes.append(list(tensor.shape))
+            bucket_refs = [
+                handle.broadcast_parameter.remote(
+                    sync_id=sync_id,
+                    bucket_index=int(bucket.bucket_index),
+                    group_name=group_name,
+                    names=names,
+                    dtypes=dtypes,
+                    shapes=shapes,
+                )
+                for _engine_index, handle in sorted(target_handles.items())
+            ]
+            nested_refs.extend(bucket_refs)
+
+            free_bytes = _query_free_bytes(device)
+            staging_mode = _plan_bucket_staging(
+                int(bucket.size_bytes), free_bytes, margin_bytes
+            )
+            if staging_mode == "bucket":
+                staged = {
+                    name: tensor.to(device) for name, tensor in bucket.params.items()
+                }
+                for name in names:
+                    _check_transport_deadline(
+                        transport_deadline, sync_id, int(bucket.bucket_index)
+                    )
+                    dist.broadcast(staged[name], 0, group=sender_group)
+                staged.clear()
+            else:
+                logger.warning(
+                    "_run_sender_broadcast sync_id=%s bucket=%s: free VRAM %d B < "
+                    "bucket %d B + margin %d B; degrading to tensor-by-tensor staging",
+                    sync_id,
+                    bucket.bucket_index,
+                    free_bytes,
+                    bucket.size_bytes,
+                    margin_bytes,
+                )
+                for name, tensor in bucket.params.items():
+                    _check_transport_deadline(
+                        transport_deadline, sync_id, int(bucket.bucket_index)
+                    )
+                    gpu_tensor = tensor.to(device)
+                    dist.broadcast(gpu_tensor, 0, group=sender_group)
+                    del gpu_tensor
+            # Cumulative budget: the receivers get whatever remains of the
+            # transport window, not a fresh per-bucket allowance.
+            remaining_s = transport_deadline - _monotonic()
+            if remaining_s <= 0:
+                raise TimeoutError(
+                    f"_run_sender_broadcast sync_id={sync_id} "
+                    f"bucket={bucket.bucket_index}: transport deadline exhausted "
+                    "before receiver bucket acks"
+                )
+            ray.get(bucket_refs, timeout=remaining_s)
+    finally:
+        # Sender-owned teardown (plan C6): cancel outstanding nested refs
+        # first so receivers blocked in HTTP routes cannot hold the group
+        # alive, then destroy both sides. Completed refs cancel as no-ops.
+        for ref in nested_refs:
+            try:
+                ray.cancel(ref)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("_run_sender_broadcast: ray.cancel failed: %r", exc)
+        destroy_refs = []
+        for _engine_index, handle in sorted(target_handles.items()):
+            try:
+                destroy_refs.append(
+                    handle.destroy_collective_group.remote(group_name=group_name)
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "_run_sender_broadcast sync_id=%s: destroy dispatch failed: %r",
+                    sync_id,
+                    exc,
+                )
+        if destroy_refs:
+            try:
+                ray.get(destroy_refs, timeout=teardown_grace_s)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "_run_sender_broadcast sync_id=%s: receiver group destroy "
+                    "incomplete within %.1fs: %r",
+                    sync_id,
+                    teardown_grace_s,
+                    exc,
+                )
+        if sender_group is not None:
+            try:
+                dist.destroy_process_group(sender_group)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "_run_sender_broadcast sync_id=%s: sender destroy_process_group "
+                    "failed: %r",
+                    sync_id,
+                    exc,
+                )

@@ -140,15 +140,40 @@ def _overlap_pools_from_env(num_gpus_per_node: int) -> (
                 )
         if len(set(mapping)) != len(mapping):
             raise ValueError(f"{label}={mapping} has duplicate GPU ids")
-    if not set(p1_train).issubset(set(p1_infer)):
+    # Per-pipeline topology families (rlix#42):
+    #   subset   (train ⊆ infer) — classic M11 partial overlap, fully tested;
+    #   disjoint (train ∩ infer == ∅) — dedicated train card(s); no engine
+    #            shares the sender's GPU, so all-broadcast NCCL transport
+    #            is possible. Newly admitted; logged as experimental.
+    # A PARTIAL intersection (crossing but neither subset nor disjoint)
+    # stays rejected: the scheduler's donor-shrink/grant accounting for a
+    # train pool that is half-inside / half-outside the infer pool has no
+    # test coverage yet — fail fast with the reason rather than wedge a
+    # run mid-training.
+    for label_t, train, label_i, infer in (
+        ("p1_train", p1_train, "p1_infer", p1_infer),
+        ("p2_train", p2_train, "p2_infer", p2_infer),
+    ):
+        train_set, infer_set = set(train), set(infer)
+        if train_set.issubset(infer_set):
+            continue
+        if not (train_set & infer_set):
+            import logging as _logging
+
+            _logging.getLogger("run_miles_dual").warning(
+                "%s=%s is fully DISJOINT from %s=%s — dedicated-train "
+                "topology (rlix#42): no colocate engines; every engine is "
+                "NCCL-broadcast-eligible. Newer than the overlap contract; "
+                "watch the first run.",
+                label_t, train, label_i, infer,
+            )
+            continue
         raise ValueError(
-            f"p1_train={p1_train} not ⊆ p1_infer={p1_infer} "
-            f"(per-pipeline partial-overlap invariant)"
-        )
-    if not set(p2_train).issubset(set(p2_infer)):
-        raise ValueError(
-            f"p2_train={p2_train} not ⊆ p2_infer={p2_infer} "
-            f"(per-pipeline partial-overlap invariant)"
+            f"{label_t}={train} partially intersects {label_i}={infer}: "
+            "each pipeline's train pool must be either a subset of its "
+            "infer pool (overlap/time-sharing) or fully disjoint from it "
+            "(dedicated train cards). Mixed shapes are unsupported — the "
+            "scheduler's shrink/grant accounting for them is unverified."
         )
     return (p1_train, p1_infer), (p2_train, p2_infer)
 
@@ -226,10 +251,16 @@ def _build_pipeline(
 
     train_size = len(train_mapping)
     infer_size = len(infer_mapping)
-    if not set(train_mapping).issubset(set(infer_mapping)):
+    # Same two-family rule as _overlap_pools_from_env (rlix#42): subset
+    # (overlap/time-sharing) or fully-disjoint (dedicated train cards)
+    # are valid; partial intersections are rejected there before this
+    # point, so only re-assert the invariant pair here.
+    _train_set, _infer_set = set(train_mapping), set(infer_mapping)
+    if not _train_set.issubset(_infer_set) and (_train_set & _infer_set):
         raise ValueError(
-            f"mp{pipeline_index}: train_mapping={train_mapping} not ⊆ "
-            f"infer_mapping={infer_mapping} (per-pipeline partial-overlap)"
+            f"mp{pipeline_index}: train_mapping={train_mapping} partially "
+            f"intersects infer_mapping={infer_mapping}; must be a subset "
+            "(overlap) or fully disjoint (dedicated train cards)"
         )
     args = _per_pipeline_args(
         base_args,
