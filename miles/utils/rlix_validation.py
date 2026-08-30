@@ -405,29 +405,10 @@ def assert_rlix_topology(args: Any, sglang_config: Any | None = None) -> None:
     )
 
 
-def assert_partial_overlap_standalone_safe(args: Any) -> None:
-    """Deprecated no-op kept for callsite stability.
-
-    Originally intended to refuse partial-overlap topologies under the
-    standalone entry. Removed because the standalone ``create_placement_groups``
-    path offsets the rollout pool by ``actor_num_nodes * actor_num_gpus_per_node``,
-    so zero-based ``train ⊂ infer`` is also true for valid disjoint
-    standalone configs (e.g. 4 actor GPUs + ``--rollout-num-gpus 8``).
-    Auto-classifying intent from args alone is unsafe; the env-var guard
-    (``RLIX_CONTROL_PLANE=rlix``) is the only reliable signal at the standalone
-    entry. RLix-mode partial-overlap correctness is enforced by
-    :func:`assert_rlix_topology` (C1) inside the RLix entry driver.
-    """
-    # Intentional no-op — see docstring.
-    del args
-    return None
-
-
 __all__ = [
     "is_rlix_mode",
     "train_devices_subset_of_infer",
     "async_generation_enabled",
     "single_updateable_model_and_server",
     "assert_rlix_topology",
-    "assert_partial_overlap_standalone_safe",
 ]
