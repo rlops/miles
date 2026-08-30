@@ -952,16 +952,9 @@ class MegatronTrainRayActor(TrainRayActor):
     ) -> None:
         """In-method helper: dynamic NCCL broadcast of bucket payloads.
 
-        **MILES-side self-guard (cross-cutting review P1-8)**: the sender-
-        side ``init_process_group`` + per-bucket ``dist.broadcast`` +
-        ``dist.destroy_process_group`` is NOT yet wired here. The
-        receiver-side fan-out below (``setup_collective_group`` +
-        ``broadcast_parameter`` + ``destroy_collective_group``) would
-        block forever on ``init_weights_update_group`` waiting for an
-        absent rank-0 sender. Until the sender path lands, refuse to
-        even attempt the receiver-side setup so MILES does not depend
-        on the RLix-side service guard for safety. The MILES contract
-        is "zero RLix import dependency"; MILES must self-guard.
+        The sender-side NCCL path is not wired yet, so fail before
+        receivers enter collective-group setup and wait for an absent
+        rank-0 sender.
         """
         if not target_handles:
             return
@@ -973,56 +966,6 @@ class MegatronTrainRayActor(TrainRayActor):
             "already raises in iter 19/20; this MILES-side guard makes "
             "the same invariant explicit at the receiver fan-out."
         )
-        if world_size <= 0:
-            raise ValueError(
-                f"_dispatch_nccl_broadcast requires world_size > 0; got {world_size}"
-            )
-        # Receiver-side group create with the same world_size value the
-        # sender uses (cache_owner == rank 0, plus one entry per
-        # receiver engine that participates in the broadcast).
-        ray.get(
-            [
-                handle.setup_collective_group.remote(
-                    group_name=group_name,
-                    master_addr=master_addr,
-                    master_port=master_port,
-                    rank=comm_ranks[engine_index],
-                    world_size=int(world_size),
-                )
-                for engine_index, handle in target_handles.items()
-            ]
-        )
-        try:
-            for bucket in buckets:
-                # Per-bucket metadata for SGLang's
-                # update_weights_from_distributed admin route.
-                names: list[str] = []
-                dtypes: list[str] = []
-                shapes: list[list[int]] = []
-                for name, tensor in bucket.params.items():
-                    names.append(name)
-                    dtypes.append(str(tensor.dtype).replace("torch.", ""))
-                    shapes.append(list(tensor.shape))
-                ray.get(
-                    [
-                        handle.broadcast_parameter.remote(
-                            sync_id=sync_id,
-                            bucket_index=int(bucket.bucket_index),
-                            group_name=group_name,
-                            names=names,
-                            dtypes=dtypes,
-                            shapes=shapes,
-                        )
-                        for handle in target_handles.values()
-                    ]
-                )
-        finally:
-            ray.get(
-                [
-                    handle.destroy_collective_group.remote(group_name=group_name)
-                    for handle in target_handles.values()
-                ]
-            )
 
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:
         old_args = self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune
