@@ -37,7 +37,62 @@ def _build_cluster_device_mappings(args) -> dict[str, list[int]]:
     convention) so train can be a strict subset of infer (partial
     overlap topology). No new device_mapping CLI args are introduced
     (Layer 1 forbidden).
+
+    rlix#42 explicit-mapping override: ``MILES_SINGLE_TRAIN_GPUS`` /
+    ``MILES_SINGLE_INFER_GPUS`` (comma lists of physical GPU ids) replace
+    the range derivation, admitting the dedicated-train (fully-disjoint)
+    topology — the minimal all-NCCL-broadcast shape (e.g. train "0",
+    infer "1,2"). Same two-family invariant as the dual driver: subset
+    (overlap) or fully disjoint; partial intersections rejected.
     """
+    import os
+
+    train_env = os.environ.get("MILES_SINGLE_TRAIN_GPUS", "").strip()
+    infer_env = os.environ.get("MILES_SINGLE_INFER_GPUS", "").strip()
+    if train_env or infer_env:
+        if not (train_env and infer_env):
+            raise ValueError(
+                "MILES_SINGLE_TRAIN_GPUS and MILES_SINGLE_INFER_GPUS must be "
+                "set together (comma lists of physical GPU ids)"
+            )
+        train = [int(g) for g in train_env.split(",") if g.strip() != ""]
+        infer = [int(g) for g in infer_env.split(",") if g.strip() != ""]
+        for label, mapping in (("train", train), ("infer", infer)):
+            if len(set(mapping)) != len(mapping):
+                raise ValueError(f"MILES_SINGLE_{label.upper()}_GPUS has duplicates: {mapping}")
+        train_set, infer_set = set(train), set(infer)
+        if not train_set.issubset(infer_set) and (train_set & infer_set):
+            raise ValueError(
+                f"train={train} partially intersects infer={infer}: must be a "
+                "subset (overlap) or fully disjoint (dedicated train cards)"
+            )
+        # The mapping lengths MUST match the CLI counts that still size
+        # the actual actors (RayTrainGroup uses actor_num_nodes ×
+        # actor_num_gpus_per_node; Phase B uses rollout_num_gpus) — a
+        # divergence would fail late in scheduler/placement work or
+        # silently allocate an unintended topology (codex impl-r9).
+        expected_train = int(args.actor_num_nodes) * int(args.actor_num_gpus_per_node)
+        expected_infer = int(args.rollout_num_gpus)
+        if len(train) != expected_train or len(infer) != expected_infer:
+            raise ValueError(
+                f"MILES_SINGLE_TRAIN_GPUS={train} / MILES_SINGLE_INFER_GPUS={infer} "
+                f"lengths must match the CLI-derived worker counts: expected "
+                f"len(train)=={expected_train} (actor_num_nodes × "
+                f"actor_num_gpus_per_node) and len(infer)=={expected_infer} "
+                f"(rollout_num_gpus); got {len(train)} / {len(infer)}"
+            )
+        if not (train_set & infer_set):
+            import logging as _logging
+
+            _logging.getLogger("run_miles_rlix").warning(
+                "train=%s is fully DISJOINT from infer=%s — dedicated-train "
+                "topology (rlix#42): no colocate engines; every engine is "
+                "NCCL-broadcast-eligible.",
+                train,
+                infer,
+            )
+        return {"actor_train": train, "actor_infer": infer}
+
     actor_count = int(args.actor_num_nodes) * int(args.actor_num_gpus_per_node)
     rollout_count = int(args.rollout_num_gpus)
     return {
